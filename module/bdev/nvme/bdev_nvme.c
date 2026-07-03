@@ -191,6 +191,8 @@ static struct spdk_bdev_nvme_opts g_opts = {
 	.enable_flush = false,
 };
 
+static __thread enum spdk_nvme_qprio g_thread_qprio_hint = SPDK_NVME_QPRIO_URGENT;
+
 #define NVME_HOTPLUG_POLL_PERIOD_MAX			10000000ULL
 #define NVME_HOTPLUG_POLL_PERIOD_DEFAULT		100000ULL
 
@@ -218,6 +220,37 @@ static int bdev_nvme_readv(struct nvme_bdev_io *bio, struct iovec *iov, int iovc
 			   struct spdk_accel_sequence *seq);
 static int bdev_nvme_no_pi_readv(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 				 void *md, uint64_t lba_count, uint64_t lba);
+
+static bool
+bdev_nvme_qprio_is_valid(enum spdk_nvme_qprio qprio)
+{
+	switch (qprio) {
+	case SPDK_NVME_QPRIO_URGENT:
+	case SPDK_NVME_QPRIO_HIGH:
+	case SPDK_NVME_QPRIO_MEDIUM:
+	case SPDK_NVME_QPRIO_LOW:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void
+bdev_nvme_apply_arbitration_opts(struct spdk_nvme_ctrlr_opts *opts)
+{
+	if (g_opts.low_priority_weight != 0 || g_opts.medium_priority_weight != 0 ||
+	    g_opts.high_priority_weight != 0) {
+		opts->arb_mechanism = SPDK_NVME_CC_AMS_WRR;
+	} else {
+		opts->arb_mechanism = SPDK_NVME_CC_AMS_RR;
+	}
+
+	opts->arbitration_burst = (uint8_t)g_opts.arbitration_burst;
+	opts->low_priority_weight = (uint8_t)g_opts.low_priority_weight;
+	opts->medium_priority_weight = (uint8_t)g_opts.medium_priority_weight;
+	opts->high_priority_weight = (uint8_t)g_opts.high_priority_weight;
+}
+
 static int bdev_nvme_writev(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 			    void *md, uint64_t lba_count, uint64_t lba,
 			    uint32_t flags, struct spdk_memory_domain *domain, void *domain_ctx,
@@ -1961,6 +1994,7 @@ bdev_nvme_create_qpair(struct nvme_qpair *nvme_qpair)
 		opts.async_mode = true;
 		opts.delay_cmd_submit = g_opts.delay_cmd_submit;
 	}
+	opts.qprio = g_thread_qprio_hint;
 	opts.io_queue_requests = spdk_max(g_opts.io_queue_requests, opts.io_queue_requests);
 	g_opts.io_queue_requests = opts.io_queue_requests;
 
@@ -1969,6 +2003,7 @@ bdev_nvme_create_qpair(struct nvme_qpair *nvme_qpair)
 		return -1;
 	}
 
+	nvme_qpair->qprio = opts.qprio;
 	SPDK_DTRACE_PROBE3(bdev_nvme_create_qpair, nvme_ctrlr->nbdev_ctrlr->name,
 			   spdk_nvme_qpair_get_id(qpair), spdk_thread_get_id(nvme_ctrlr->thread));
 
@@ -4770,10 +4805,7 @@ hotplug_probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		}
 	}
 
-	opts->arbitration_burst = (uint8_t)g_opts.arbitration_burst;
-	opts->low_priority_weight = (uint8_t)g_opts.low_priority_weight;
-	opts->medium_priority_weight = (uint8_t)g_opts.medium_priority_weight;
-	opts->high_priority_weight = (uint8_t)g_opts.high_priority_weight;
+	bdev_nvme_apply_arbitration_opts(opts);
 	opts->disable_read_ana_log_page = true;
 
 	SPDK_DEBUGLOG(bdev_nvme, "Attaching to %s\n", trid->traddr);
@@ -6382,6 +6414,23 @@ spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 	return 0;
 }
 
+int
+spdk_bdev_nvme_set_thread_qprio(enum spdk_nvme_qprio qprio)
+{
+	if (!bdev_nvme_qprio_is_valid(qprio)) {
+		return -EINVAL;
+	}
+
+	g_thread_qprio_hint = qprio;
+	return 0;
+}
+
+enum spdk_nvme_qprio
+spdk_bdev_nvme_get_thread_qprio(void)
+{
+	return g_thread_qprio_hint;
+}
+
 struct set_nvme_hotplug_ctx {
 	uint64_t period_us;
 	bool enabled;
@@ -6807,6 +6856,7 @@ spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 	}
 
 	memcpy(&ctx->drv_opts, drv_opts, sizeof(*drv_opts));
+	bdev_nvme_apply_arbitration_opts(&ctx->drv_opts);
 	ctx->drv_opts.transport_retry_count = g_opts.transport_retry_count;
 	ctx->drv_opts.transport_ack_timeout = g_opts.transport_ack_timeout;
 	ctx->drv_opts.keep_alive_timeout_ms = g_opts.keep_alive_timeout_ms;
@@ -7762,6 +7812,7 @@ bdev_nvme_start_discovery(struct spdk_nvme_transport_id *trid,
 		return -ENOMEM;
 	}
 	memcpy(&ctx->drv_opts, drv_opts, sizeof(*drv_opts));
+	bdev_nvme_apply_arbitration_opts(&ctx->drv_opts);
 	memcpy(&ctx->bdev_opts, bdev_opts, sizeof(*bdev_opts));
 	ctx->from_mdns_discovery_service = from_mdns;
 	ctx->bdev_opts.from_discovery_service = true;

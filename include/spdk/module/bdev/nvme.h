@@ -197,6 +197,24 @@ void spdk_bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts, size_t opts_size)
  */
 int spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts);
 
+/**
+ * Set the NVMe I/O queue priority hint for the current SPDK thread.
+ *
+ * This hint is consumed when the bdev NVMe module allocates a new I/O qpair on
+ * the current thread. Existing qpairs are not modified.
+ *
+ * \param qprio Queue priority to associate with future qpairs on the current thread.
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_bdev_nvme_set_thread_qprio(enum spdk_nvme_qprio qprio);
+
+/**
+ * Get the current thread-local NVMe I/O queue priority hint.
+ *
+ * \return Queue priority hint associated with the current SPDK thread.
+ */
+enum spdk_nvme_qprio spdk_bdev_nvme_get_thread_qprio(void);
+
 #ifdef __cplusplus
 }
 #endif

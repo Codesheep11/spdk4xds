@@ -13,6 +13,7 @@
 #include "spdk/string.h"
 #include "nvme_internal.h"
 #include "nvme_pcie_internal.h"
+#include "nvme_xds_registry.h"
 #include "spdk/trace.h"
 
 #include "spdk_internal/trace_defs.h"
@@ -24,10 +25,69 @@ static struct spdk_nvme_pcie_stat g_dummy_stat = {};
 static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
 		struct nvme_tracker *tr);
 
+static inline int
+nvme_pcie_xds_translate(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t req_size,
+			uint64_t *phys_addr, uint64_t *translated)
+{
+	if (!spdk_nvme_xds_translate) {
+		return -ENOENT;
+	}
+
+	return spdk_nvme_xds_translate(ctrlr->trid.traddr, buf, req_size, phys_addr, translated);
+}
+
 static inline uint64_t
 nvme_pcie_vtophys(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t *size)
 {
 	if (spdk_likely(ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE)) {
+		uint64_t phys_addr;
+		uint64_t req_size = size ? *size : UINT64_MAX;
+		uint64_t translated = 0;
+		int rc;
+
+		phys_addr = spdk_vtophys(buf, size);
+		if (spdk_likely(phys_addr != SPDK_VTOPHYS_ERROR)) {
+			return phys_addr;
+		}
+
+		/*
+		 * xDS translation uses the registry initialized for the
+		 * current process and returns the peer-DMA address for a
+		 * registered GPU buffer with a prewarmed peer mapping when
+		 * regular vtophys translation fails.
+		 */
+		rc = nvme_pcie_xds_translate(ctrlr, buf, req_size, &phys_addr, &translated);
+		if (rc == 0) {
+			if (size) {
+				*size = translated;
+			}
+			return phys_addr;
+		}
+
+		return SPDK_VTOPHYS_ERROR;
+	} else {
+		/* vfio-user address translation with IOVA=VA mode */
+		return (uint64_t)(uintptr_t)buf;
+	}
+}
+
+static inline uint64_t
+nvme_pcie_vtophys_prefer_xds(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t *size)
+{
+	if (spdk_likely(ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE)) {
+		uint64_t phys_addr;
+		uint64_t req_size = size ? *size : UINT64_MAX;
+		uint64_t translated = 0;
+		int rc;
+
+		rc = nvme_pcie_xds_translate(ctrlr, buf, req_size, &phys_addr, &translated);
+		if (rc == 0) {
+			if (size) {
+				*size = translated;
+			}
+			return phys_addr;
+		}
+
 		return spdk_vtophys(buf, size);
 	} else {
 		/* vfio-user address translation with IOVA=VA mode */
@@ -1261,7 +1321,7 @@ nvme_pcie_prp_list_append(struct spdk_nvme_ctrlr *ctrlr, struct nvme_tracker *tr
 			return -EFAULT;
 		}
 
-		phys_addr = nvme_pcie_vtophys(ctrlr, virt_addr, NULL);
+		phys_addr = nvme_pcie_vtophys_prefer_xds(ctrlr, virt_addr, NULL);
 		if (spdk_unlikely(phys_addr == SPDK_VTOPHYS_ERROR)) {
 			NVME_QPAIR_ERRLOG(tr->req->qpair, "vtophys(%p) failed\n", virt_addr);
 			return -EFAULT;
@@ -1375,7 +1435,7 @@ nvme_pcie_qpair_build_contig_hw_sgl_request(struct spdk_nvme_qpair *qpair, struc
 		}
 
 		mapping_length = length;
-		phys_addr = nvme_pcie_vtophys(qpair->ctrlr, virt_addr, &mapping_length);
+		phys_addr = nvme_pcie_vtophys_prefer_xds(qpair->ctrlr, virt_addr, &mapping_length);
 		if (phys_addr == SPDK_VTOPHYS_ERROR) {
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return -EFAULT;
@@ -1501,7 +1561,7 @@ nvme_pcie_qpair_build_hw_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_
 			}
 
 			mapping_length = remaining_user_sge_len;
-			phys_addr = nvme_pcie_vtophys(qpair->ctrlr, virt_addr, &mapping_length);
+			phys_addr = nvme_pcie_vtophys_prefer_xds(qpair->ctrlr, virt_addr, &mapping_length);
 			if (phys_addr == SPDK_VTOPHYS_ERROR) {
 				goto exit;
 			}

@@ -179,6 +179,7 @@ struct nvme_qpair {
 	struct spdk_nvme_qpair		*qpair;
 	struct nvme_poll_group		*group;
 	struct nvme_ctrlr_channel	*ctrlr_ch;
+	enum spdk_nvme_qprio		qprio;
 
 	/* The following is used to update io_path cache of nvme_bdev_channels. */
 	TAILQ_HEAD(, nvme_io_path)	io_path_list;

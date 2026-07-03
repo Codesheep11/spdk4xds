@@ -7,6 +7,8 @@
         spdk_bdev_nvme_get_default_ctrlr_opts;
 	spdk_bdev_nvme_get_opts;
 	spdk_bdev_nvme_set_opts;
+        spdk_bdev_nvme_set_thread_qprio;
+	spdk_bdev_nvme_get_thread_qprio;
         spdk_bdev_nvme_delete;
 
 	# Everything else

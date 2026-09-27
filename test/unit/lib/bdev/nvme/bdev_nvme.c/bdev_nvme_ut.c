@@ -68,7 +68,13 @@ DEFINE_STUB(spdk_nvme_transport_set_opts, int, (const struct spdk_nvme_transport
 DEFINE_STUB(spdk_nvme_dhchap_get_digest_name, const char *, (int id), NULL);
 DEFINE_STUB(spdk_nvme_dhchap_get_dhgroup_name, const char *, (int id), NULL);
 
-DEFINE_STUB(spdk_bdev_io_get_submit_tsc, uint64_t, (struct spdk_bdev_io *bdev_io), 0);
+static uint64_t g_ut_bdev_submit_tsc;
+
+uint64_t
+spdk_bdev_io_get_submit_tsc(struct spdk_bdev_io *bdev_io)
+{
+	return g_ut_bdev_submit_tsc;
+}
 
 DEFINE_STUB_V(spdk_bdev_reset_io_stat, (struct spdk_bdev_io_stat *stat,
 					enum spdk_bdev_reset_stat_mode mode));
@@ -85,6 +91,12 @@ DEFINE_STUB(spdk_nvme_poll_group_get_fd_group, struct spdk_fd_group *,
 	    (struct spdk_nvme_poll_group *group), NULL);
 DEFINE_STUB(spdk_nvme_poll_group_wait, int, (struct spdk_nvme_poll_group *group,
 		spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb), 0);
+DEFINE_STUB(spdk_nvme_poll_group_get_stats, int,
+	    (struct spdk_nvme_poll_group *group,
+	     struct spdk_nvme_poll_group_stat **stats), -ENOTSUP);
+DEFINE_STUB_V(spdk_nvme_poll_group_free_stats,
+	      (struct spdk_nvme_poll_group *group,
+	       struct spdk_nvme_poll_group_stat *stats));
 DEFINE_STUB(spdk_nvme_ctrlr_get_admin_qp_fd, int, (struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_event_handler_opts *opts), 0);
 DEFINE_STUB(spdk_nvme_poll_group_set_interrupt_callback, int,
@@ -2454,6 +2466,9 @@ test_submit_nvme_cmd(void)
 	const int STRING_SIZE = 32;
 	const char *attached_names[STRING_SIZE];
 	struct nvme_bdev *nbdev;
+	struct nvme_bdev_channel *nbdev_ch;
+	struct nvme_bdev_io *bio;
+	struct xds_nvme_stage_profile_channel stage_profile = {};
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_io_channel *ch;
 	int rc;
@@ -2498,9 +2513,17 @@ test_submit_nvme_cmd(void)
 	ut_test_submit_nvme_cmd(ch, bdev_io, SPDK_BDEV_IO_TYPE_READ);
 
 	ut_bdev_io_set_buf(bdev_io);
+	nbdev_ch = spdk_io_channel_get_ctx(ch);
+	bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	CU_ASSERT(xds_nvme_stage_profile_channel_init(&stage_profile, 0) == 0);
+	nbdev_ch->xds_stage_profile = &stage_profile;
+	g_ut_bdev_submit_tsc = 1;
 
 	ut_test_submit_nvme_cmd(ch, bdev_io, SPDK_BDEV_IO_TYPE_READ);
+	CU_ASSERT(stage_profile.acc.samples == 1);
+	CU_ASSERT(bio->xds_stage_sample == NULL);
 	ut_test_submit_nvme_cmd(ch, bdev_io, SPDK_BDEV_IO_TYPE_WRITE);
+	CU_ASSERT(stage_profile.acc.samples == 1);
 	ut_test_submit_nvme_cmd(ch, bdev_io, SPDK_BDEV_IO_TYPE_COMPARE);
 	ut_test_submit_nvme_cmd(ch, bdev_io, SPDK_BDEV_IO_TYPE_UNMAP);
 
@@ -2517,6 +2540,9 @@ test_submit_nvme_cmd(void)
 	bdev_io->u.bdev.memory_domain = NULL;
 
 	ut_test_submit_admin_cmd(ch, bdev_io, ctrlr);
+	nbdev_ch->xds_stage_profile = NULL;
+	xds_nvme_stage_profile_channel_fini(&stage_profile);
+	g_ut_bdev_submit_tsc = 0;
 
 	free(bdev_io);
 
@@ -8296,6 +8322,199 @@ test_race_between_ctrlr_loss_timeout_and_pending_failover(void)
 	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
 }
 
+static void
+test_xds_nvme_stage_profile_core(void)
+{
+	struct xds_nvme_stage_profile_channel profile = {};
+	struct nvme_bdev_io bio = {};
+	struct xds_nvme_stage_sample *samples[XDS_NVME_STAGE_SAMPLE_POOL_SIZE];
+	struct xds_nvme_stage_sample *sample;
+	uint8_t shift = 0;
+	uint32_t i;
+
+	CU_ASSERT(xds_nvme_stage_profile_parse_shift(NULL, &shift) == -ENOENT);
+	CU_ASSERT(xds_nvme_stage_profile_parse_shift("12", &shift) == 0);
+	CU_ASSERT(shift == 12);
+	CU_ASSERT(xds_nvme_stage_profile_parse_shift("-1", &shift) == -EINVAL);
+	CU_ASSERT(xds_nvme_stage_profile_parse_shift("12x", &shift) == -EINVAL);
+	CU_ASSERT(xds_nvme_stage_profile_parse_shift("64", &shift) == -ERANGE);
+
+	CU_ASSERT(xds_nvme_stage_profile_channel_init(&profile, 12) == 0);
+	profile.sequence = 0;
+	sample = xds_nvme_stage_profile_try_alloc(&profile, 100, 110);
+	SPDK_CU_ASSERT_FATAL(sample != NULL);
+	xds_nvme_stage_profile_release(&profile, sample);
+	CU_ASSERT(xds_nvme_stage_profile_try_alloc(&profile, 100, 110) == NULL);
+	profile.sequence = 4096;
+	sample = xds_nvme_stage_profile_try_alloc(&profile, 100, 110);
+	SPDK_CU_ASSERT_FATAL(sample != NULL);
+	sample->path_done_tsc = 115;
+	sample->cmd_submit_done_tsc = 130;
+	sample->nvme_callback_tsc = 190;
+	sample->bdev_complete_tsc = 200;
+	CU_ASSERT(xds_nvme_stage_profile_finish(&profile, sample) == 0);
+	CU_ASSERT(profile.acc.samples == 1);
+	CU_ASSERT(profile.acc.bdev_dispatch_ticks == 10);
+	CU_ASSERT(profile.acc.path_select_ticks == 5);
+	CU_ASSERT(profile.acc.cmd_submit_ticks == 15);
+	CU_ASSERT(profile.acc.device_wait_ticks == 60);
+	CU_ASSERT(profile.acc.completion_ticks == 10);
+	CU_ASSERT(profile.acc.total_ticks == 100);
+
+	profile.sequence = 8192;
+	sample = xds_nvme_stage_profile_try_alloc(&profile, 200, 210);
+	SPDK_CU_ASSERT_FATAL(sample != NULL);
+	sample->path_done_tsc = 205;
+	sample->cmd_submit_done_tsc = 230;
+	sample->nvme_callback_tsc = 290;
+	sample->bdev_complete_tsc = 300;
+	CU_ASSERT(xds_nvme_stage_profile_finish(&profile, sample) == -EINVAL);
+	CU_ASSERT(profile.acc.invalid == 1);
+	xds_nvme_stage_profile_channel_fini(&profile);
+
+	memset(&profile, 0, sizeof(profile));
+	CU_ASSERT(xds_nvme_stage_profile_channel_init(&profile, 0) == 0);
+	sample = xds_nvme_stage_profile_try_alloc(&profile, 100, 110);
+	SPDK_CU_ASSERT_FATAL(sample != NULL);
+	bio.xds_stage_sample = sample;
+	xds_nvme_stage_profile_drop(&bio, XDS_NVME_STAGE_DROP_RETRY);
+	CU_ASSERT(profile.acc.retry_drops == 1);
+	CU_ASSERT(bio.xds_stage_sample == NULL);
+	sample = xds_nvme_stage_profile_try_alloc(&profile, 100, 110);
+	SPDK_CU_ASSERT_FATAL(sample != NULL);
+	bio.xds_stage_sample = sample;
+	xds_nvme_stage_profile_drop(&bio, XDS_NVME_STAGE_DROP_ERROR);
+	CU_ASSERT(profile.acc.error_drops == 1);
+	CU_ASSERT(bio.xds_stage_sample == NULL);
+	for (i = 0; i < XDS_NVME_STAGE_SAMPLE_POOL_SIZE; i++) {
+		samples[i] = xds_nvme_stage_profile_try_alloc(&profile, 100, 110);
+		SPDK_CU_ASSERT_FATAL(samples[i] != NULL);
+	}
+	CU_ASSERT(xds_nvme_stage_profile_try_alloc(&profile, 100, 110) == NULL);
+	CU_ASSERT(profile.acc.pool_drops == 1);
+	xds_nvme_stage_profile_release(&profile, samples[0]);
+	CU_ASSERT_PTR_NOT_NULL(xds_nvme_stage_profile_try_alloc(&profile, 100, 110));
+	for (i = 1; i < XDS_NVME_STAGE_SAMPLE_POOL_SIZE; i++) {
+		xds_nvme_stage_profile_release(&profile, samples[i]);
+	}
+	xds_nvme_stage_profile_channel_fini(&profile);
+}
+
+static void
+test_xds_nvme_stage_profile_format(void)
+{
+	struct xds_nvme_stage_profile_channel profile = {};
+	char line[1024];
+	int rc;
+
+	profile.shift = 12;
+	profile.acc.eligible = 8192;
+	profile.acc.samples = 2;
+	profile.acc.bdev_dispatch_ticks = 20;
+	profile.acc.path_select_ticks = 40;
+	profile.acc.cmd_submit_ticks = 60;
+	profile.acc.device_wait_ticks = 80;
+	profile.acc.completion_ticks = 100;
+	profile.acc.total_ticks = 300;
+
+	rc = xds_nvme_stage_profile_format(line, sizeof(line), "Nvme0n1", 32,
+					   &profile, 1000000);
+	CU_ASSERT(rc > 0);
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "XDS_NVME_STAGE_PROFILE bdev=Nvme0n1 core=32 shift=12"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "eligible=8192 samples=2"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "pool_drops=0 retry_drops=0 error_drops=0 invalid=0"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "bdev_dispatch_us=10.000"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "path_select_us=20.000"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "cmd_submit_us=30.000"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "device_wait_us=40.000"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "completion_us=50.000"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "total_us=150.000 closure_error_pct=0.000"));
+}
+
+static void
+test_xds_nvme_poll_profile_format(void)
+{
+	struct xds_nvme_completion_batch_profile batch_profile = {};
+	struct spdk_nvme_pcie_stat stat = {
+		.polls = 100,
+		.idle_polls = 60,
+		.completions = 80,
+		.submitted_requests = 90,
+		.queued_requests = 2,
+		.sq_mmio_doorbell_updates = 30,
+		.sq_shadow_doorbell_updates = 4,
+		.cq_mmio_doorbell_updates = 20,
+		.cq_shadow_doorbell_updates = 3,
+	};
+	struct spdk_nvme_pcie_stat idle_stat = {
+		.polls = 10,
+		.idle_polls = 10,
+	};
+	char line[512];
+	int rc;
+
+	xds_nvme_poll_profile_record_batch(&batch_profile, 0);
+	xds_nvme_poll_profile_record_batch(&batch_profile, -1);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 1);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 2);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 3);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 4);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 5);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 8);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 9);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 16);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 17);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 32);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 33);
+	xds_nvme_poll_profile_record_batch(&batch_profile, 64);
+	CU_ASSERT(batch_profile.bins[0] == 1);
+	CU_ASSERT(batch_profile.bins[1] == 1);
+	CU_ASSERT(batch_profile.bins[2] == 2);
+	CU_ASSERT(batch_profile.bins[3] == 2);
+	CU_ASSERT(batch_profile.bins[4] == 2);
+	CU_ASSERT(batch_profile.bins[5] == 2);
+	CU_ASSERT(batch_profile.bins[6] == 2);
+	CU_ASSERT(batch_profile.max_completions == 64);
+
+	rc = xds_nvme_poll_profile_format(line, sizeof(line), 32, &stat,
+					  &batch_profile);
+	CU_ASSERT(rc > 0);
+	CU_ASSERT_PTR_NOT_NULL(strstr(line,
+		"XDS_NVME_POLL_PROFILE core=32 polls=100 idle_polls=60 completions=80"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "submitted=90 queued=2"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "sq_mmio=30 sq_shadow=4"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line, "cq_mmio=20 cq_shadow=3"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line,
+		"active_polls=40 completions_per_active_poll=2.000"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line,
+		"completion_batch_1=1 completion_batch_2=1 completion_batch_3_4=2"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line,
+		"completion_batch_5_8=2 completion_batch_9_16=2"));
+	CU_ASSERT_PTR_NOT_NULL(strstr(line,
+		"completion_batch_17_32=2 completion_batch_33_plus=2 completion_batch_max=64"));
+
+	rc = xds_nvme_poll_profile_format(line, sizeof(line), 32, &idle_stat,
+					  &batch_profile);
+	CU_ASSERT(rc > 0);
+	CU_ASSERT_PTR_NOT_NULL(strstr(line,
+		"active_polls=0 completions_per_active_poll=0.000"));
+}
+
+static void
+test_xds_nvme_poll_profile_parse(void)
+{
+	bool enabled = true;
+
+	CU_ASSERT(xds_nvme_parse_poll_profile(NULL, &enabled) == -ENOENT);
+	CU_ASSERT(xds_nvme_parse_poll_profile("0", &enabled) == 0);
+	CU_ASSERT(enabled == false);
+	CU_ASSERT(xds_nvme_parse_poll_profile("1", &enabled) == 0);
+	CU_ASSERT(enabled == true);
+	CU_ASSERT(xds_nvme_parse_poll_profile("2", &enabled) == -EINVAL);
+	CU_ASSERT(xds_nvme_parse_poll_profile("true", &enabled) == -EINVAL);
+	CU_ASSERT(xds_nvme_parse_poll_profile("1", NULL) == -EINVAL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -8358,6 +8577,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_bdev_reset_abort_io);
 	CU_ADD_TEST(suite, test_race_between_clear_pending_resets_and_reset_ctrlr_complete);
 	CU_ADD_TEST(suite, test_race_between_ctrlr_loss_timeout_and_pending_failover);
+	CU_ADD_TEST(suite, test_xds_nvme_stage_profile_core);
+	CU_ADD_TEST(suite, test_xds_nvme_stage_profile_format);
+	CU_ADD_TEST(suite, test_xds_nvme_poll_profile_format);
+	CU_ADD_TEST(suite, test_xds_nvme_poll_profile_parse);
 
 	allocate_threads(3);
 	set_thread(0);

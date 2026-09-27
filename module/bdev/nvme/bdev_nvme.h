@@ -207,6 +207,46 @@ struct nvme_io_path {
 	struct spdk_bdev_io_stat	*stat;
 };
 
+#define XDS_NVME_STAGE_SAMPLE_POOL_SIZE 64u
+
+struct xds_nvme_stage_profile_channel;
+
+struct xds_nvme_stage_sample {
+	uint64_t bdev_submit_tsc;
+	uint64_t module_entry_tsc;
+	uint64_t path_done_tsc;
+	uint64_t cmd_submit_done_tsc;
+	uint64_t nvme_callback_tsc;
+	uint64_t bdev_complete_tsc;
+	struct xds_nvme_stage_profile_channel *owner;
+	bool active;
+};
+
+struct xds_nvme_stage_accumulator {
+	uint64_t eligible;
+	uint64_t samples;
+	uint64_t bdev_dispatch_ticks;
+	uint64_t path_select_ticks;
+	uint64_t cmd_submit_ticks;
+	uint64_t device_wait_ticks;
+	uint64_t completion_ticks;
+	uint64_t total_ticks;
+	uint64_t pool_drops;
+	uint64_t retry_drops;
+	uint64_t error_drops;
+	uint64_t invalid;
+};
+
+struct xds_nvme_stage_profile_channel {
+	struct xds_nvme_stage_sample *pool;
+	struct xds_nvme_stage_accumulator acc;
+	uint64_t sequence;
+	uint64_t sample_mask;
+	uint8_t free_stack[XDS_NVME_STAGE_SAMPLE_POOL_SIZE];
+	uint8_t free_count;
+	uint8_t shift;
+};
+
 struct nvme_bdev_channel {
 	struct nvme_io_path			*current_io_path;
 	enum spdk_bdev_nvme_multipath_policy	mp_policy;
@@ -216,7 +256,15 @@ struct nvme_bdev_channel {
 	STAILQ_HEAD(, nvme_io_path)		io_path_list;
 	TAILQ_HEAD(retry_io_head, nvme_bdev_io)	retry_io_list;
 	struct spdk_poller			*retry_io_poller;
+	struct xds_nvme_stage_profile_channel	*xds_stage_profile;
 	bool					resetting;
+};
+
+#define XDS_NVME_COMPLETION_BATCH_BINS 7
+
+struct xds_nvme_completion_batch_profile {
+	uint64_t bins[XDS_NVME_COMPLETION_BATCH_BINS];
+	uint64_t max_completions;
 };
 
 struct nvme_poll_group {
@@ -227,6 +275,7 @@ struct nvme_poll_group {
 	uint64_t				spin_ticks;
 	uint64_t				start_ticks;
 	uint64_t				end_ticks;
+	struct xds_nvme_completion_batch_profile	xds_completion_batch_profile;
 	TAILQ_HEAD(, nvme_qpair)		qpair_list;
 	struct spdk_interrupt			*intr;
 };

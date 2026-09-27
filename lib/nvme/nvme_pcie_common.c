@@ -29,11 +29,662 @@ static inline int
 nvme_pcie_xds_translate(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t req_size,
 			uint64_t *phys_addr, uint64_t *translated)
 {
-	if (!spdk_nvme_xds_translate) {
+	return spdk_nvme_xds_translate(ctrlr->trid.traddr, buf, req_size, phys_addr, translated);
+}
+
+static int
+xds_nvme_pcie_profile_parse_shift(const char *value, uint8_t *shift)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (!value) {
 		return -ENOENT;
 	}
+	if (value[0] == '\0' || value[0] == '-') {
+		return -EINVAL;
+	}
 
-	return spdk_nvme_xds_translate(ctrlr->trid.traddr, buf, req_size, phys_addr, translated);
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0') {
+		return -EINVAL;
+	}
+	if (parsed > 63) {
+		return -ERANGE;
+	}
+
+	*shift = (uint8_t)parsed;
+	return 0;
+}
+
+static uint64_t
+xds_nvme_pcie_profile_random(struct xds_nvme_pcie_profile *profile)
+{
+	uint64_t random = profile->sample_prng;
+
+	random ^= random >> 12;
+	random ^= random << 25;
+	random ^= random >> 27;
+	profile->sample_prng = random;
+	return random * UINT64_C(0x2545f4914f6cdd1d);
+}
+
+static uint8_t
+xds_nvme_pcie_qd_bucket(uint16_t qd)
+{
+	if (qd == 0) {
+		return 0;
+	}
+	if (qd <= 7) {
+		return 1;
+	}
+	if (qd <= 15) {
+		return 2;
+	}
+	if (qd <= 23) {
+		return 3;
+	}
+	if (qd <= 27) {
+		return 4;
+	}
+	if (qd <= 31) {
+		return 5;
+	}
+	return 6;
+}
+
+static uint64_t
+xds_nvme_pcie_profile_qd_ticks(const uint64_t ticks[7])
+{
+	uint64_t total = 0;
+	uint32_t i;
+
+	for (i = 0; i < 7; i++) {
+		total += ticks[i];
+	}
+	return total;
+}
+
+static void
+xds_nvme_pcie_profile_qd_commit_window(
+	struct xds_nvme_pcie_profile *profile)
+{
+	if (xds_nvme_pcie_profile_qd_ticks(profile->qd_residency_ticks) <=
+	    xds_nvme_pcie_profile_qd_ticks(profile->qd_best_residency_ticks)) {
+		return;
+	}
+	memcpy(profile->qd_best_residency_ticks,
+	       profile->qd_residency_ticks,
+	       sizeof(profile->qd_best_residency_ticks));
+	profile->qd_best_low_qd_episodes = profile->low_qd_episodes;
+	profile->qd_best_low_qd_max_ticks = profile->low_qd_max_ticks;
+}
+
+static void
+xds_nvme_pcie_profile_qd_transition_at(struct xds_nvme_pcie_profile *profile,
+					uint16_t new_qd, uint64_t now_tsc)
+{
+	uint64_t elapsed;
+
+	if (!profile) {
+		return;
+	}
+	if (!profile->qd_started) {
+		profile->qd_started = true;
+		profile->qd_last = new_qd;
+		profile->qd_last_tsc = now_tsc;
+		if (new_qd < 28) {
+			profile->low_qd_start_tsc = now_tsc;
+		}
+		return;
+	}
+	if (now_tsc < profile->qd_last_tsc) {
+		return;
+	}
+	elapsed = now_tsc - profile->qd_last_tsc;
+	if (profile->qd_last == 0 && new_qd > 0 &&
+	    profile->qd_idle_reset_ticks != 0 &&
+	    elapsed > profile->qd_idle_reset_ticks) {
+		xds_nvme_pcie_profile_qd_commit_window(profile);
+		memset(profile->qd_residency_ticks, 0,
+		       sizeof(profile->qd_residency_ticks));
+		profile->low_qd_episodes = 0;
+		profile->low_qd_max_ticks = 0;
+		profile->low_qd_start_tsc = new_qd < 28 ? now_tsc : 0;
+		profile->qd_last = new_qd;
+		profile->qd_last_tsc = now_tsc;
+		return;
+	}
+	profile->qd_residency_ticks[xds_nvme_pcie_qd_bucket(profile->qd_last)] +=
+		elapsed;
+	if (profile->qd_last < 28 && new_qd >= 28) {
+		uint64_t low_ticks = now_tsc - profile->low_qd_start_tsc;
+
+		profile->low_qd_episodes++;
+		if (low_ticks > profile->low_qd_max_ticks) {
+			profile->low_qd_max_ticks = low_ticks;
+		}
+		profile->low_qd_start_tsc = 0;
+	} else if (profile->qd_last >= 28 && new_qd < 28) {
+		profile->low_qd_start_tsc = now_tsc;
+	}
+	profile->qd_last = new_qd;
+	profile->qd_last_tsc = now_tsc;
+}
+
+static void
+xds_nvme_pcie_profile_qd_flush_at(struct xds_nvme_pcie_profile *profile,
+				   uint64_t now_tsc)
+{
+	uint64_t low_ticks;
+
+	if (!profile || !profile->qd_started || now_tsc < profile->qd_last_tsc) {
+		return;
+	}
+	if (profile->qd_last == 0 && profile->qd_idle_reset_ticks != 0 &&
+	    now_tsc - profile->qd_last_tsc > profile->qd_idle_reset_ticks) {
+		profile->qd_last_tsc = now_tsc;
+		return;
+	}
+	profile->qd_residency_ticks[xds_nvme_pcie_qd_bucket(profile->qd_last)] +=
+		now_tsc - profile->qd_last_tsc;
+	profile->qd_last_tsc = now_tsc;
+	if (profile->qd_last >= 28 || profile->low_qd_start_tsc == 0) {
+		return;
+	}
+	low_ticks = now_tsc - profile->low_qd_start_tsc;
+	if (low_ticks > profile->low_qd_max_ticks) {
+		profile->low_qd_max_ticks = low_ticks;
+	}
+}
+
+static void
+xds_nvme_pcie_profile_qd_finalize_at(struct xds_nvme_pcie_profile *profile,
+				      uint64_t now_tsc)
+{
+	if (!profile) {
+		return;
+	}
+	xds_nvme_pcie_profile_qd_flush_at(profile, now_tsc);
+	xds_nvme_pcie_profile_qd_commit_window(profile);
+	memcpy(profile->qd_residency_ticks,
+	       profile->qd_best_residency_ticks,
+	       sizeof(profile->qd_residency_ticks));
+	profile->low_qd_episodes = profile->qd_best_low_qd_episodes;
+	profile->low_qd_max_ticks = profile->qd_best_low_qd_max_ticks;
+}
+
+static int
+xds_nvme_pcie_profile_init(struct nvme_pcie_qpair *pqpair, const char *shift_value)
+{
+	struct xds_nvme_pcie_profile *profile;
+	uint8_t shift;
+	uint32_t i;
+	int rc;
+
+	if (!pqpair) {
+		return -EINVAL;
+	}
+
+	rc = xds_nvme_pcie_profile_parse_shift(shift_value, &shift);
+	if (rc == -ENOENT) {
+		return 0;
+	}
+	if (rc != 0 || pqpair->num_entries == 0) {
+		return rc != 0 ? rc : -EINVAL;
+	}
+
+	profile = calloc(1, sizeof(*profile));
+	if (!profile) {
+		return -ENOMEM;
+	}
+	profile->samples = calloc(XDS_NVME_PCIE_SAMPLE_POOL_SIZE,
+				  sizeof(*profile->samples));
+	profile->sample_by_cid = malloc(pqpair->num_entries *
+					sizeof(*profile->sample_by_cid));
+	profile->latency_ticks = malloc(XDS_NVME_PCIE_LATENCY_RESERVOIR_SIZE *
+				       sizeof(*profile->latency_ticks));
+	if (!profile->samples || !profile->sample_by_cid ||
+	    !profile->latency_ticks) {
+		free(profile->latency_ticks);
+		free(profile->sample_by_cid);
+		free(profile->samples);
+		free(profile);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < pqpair->num_entries; i++) {
+		profile->sample_by_cid[i] = -1;
+	}
+	for (i = 0; i < XDS_NVME_PCIE_SAMPLE_POOL_SIZE; i++) {
+		profile->free_stack[i] = (uint8_t)i;
+	}
+	profile->free_count = XDS_NVME_PCIE_SAMPLE_POOL_SIZE;
+	profile->shift = shift;
+	profile->sample_mask = shift == 0 ? 0 : ((UINT64_C(1) << shift) - 1);
+	profile->sample_prng = UINT64_C(0x9e3779b97f4a7c15) ^
+			       ((uint64_t)pqpair->qpair.id << 32);
+	profile->next_sample = xds_nvme_pcie_profile_random(profile) &
+			       profile->sample_mask;
+	profile->qd_idle_reset_ticks = spdk_get_ticks_hz() / 1000;
+	profile->enabled = true;
+	pqpair->xds_profile = profile;
+	pqpair->flags.xds_profile_enabled = 1;
+	return 0;
+}
+
+static void
+xds_nvme_pcie_profile_advance_sample(struct xds_nvme_pcie_profile *profile,
+				     uint64_t sampled_index)
+{
+	uint64_t block_start = sampled_index & ~profile->sample_mask;
+	uint64_t period = profile->sample_mask + 1;
+	uint64_t next_offset;
+
+	next_offset = xds_nvme_pcie_profile_random(profile) &
+		      profile->sample_mask;
+
+	/* Keep one sample per period while randomizing its low-bit phase. */
+	if (block_start > UINT64_MAX - period) {
+		profile->next_sample = UINT64_MAX;
+		return;
+	}
+	profile->next_sample = block_start + period + next_offset;
+}
+
+static void
+xds_nvme_pcie_profile_fini(struct nvme_pcie_qpair *pqpair)
+{
+	struct xds_nvme_pcie_profile *profile;
+	uint32_t i;
+
+	if (!pqpair || !pqpair->xds_profile) {
+		return;
+	}
+
+	profile = pqpair->xds_profile;
+	for (i = 0; i < XDS_NVME_PCIE_SAMPLE_POOL_SIZE; i++) {
+		if (profile->samples[i].active) {
+			profile->incomplete++;
+		}
+	}
+	free(profile->sample_by_cid);
+	free(profile->samples);
+	free(profile->latency_ticks);
+	free(profile);
+	pqpair->xds_profile = NULL;
+	pqpair->flags.xds_profile_enabled = 0;
+}
+
+static struct xds_nvme_pcie_sample *
+xds_nvme_pcie_profile_try_begin(struct nvme_pcie_qpair *pqpair, uint16_t cid,
+				uint64_t now_tsc)
+{
+	struct xds_nvme_pcie_profile *profile;
+	struct xds_nvme_pcie_sample *sample;
+	uint64_t eligible_index;
+	uint8_t index;
+
+	if (!pqpair || !pqpair->flags.xds_profile_enabled || !pqpair->xds_profile) {
+		return NULL;
+	}
+	profile = pqpair->xds_profile;
+	eligible_index = profile->eligible++;
+	if (eligible_index != profile->next_sample) {
+		return NULL;
+	}
+	xds_nvme_pcie_profile_advance_sample(profile, eligible_index);
+	if (cid >= pqpair->num_entries || profile->sample_by_cid[cid] >= 0) {
+		profile->invalid++;
+		return NULL;
+	}
+	if (profile->free_count == 0 ||
+	    profile->pending_count == XDS_NVME_PCIE_SAMPLE_POOL_SIZE) {
+		profile->pool_drops++;
+		return NULL;
+	}
+
+	index = profile->free_stack[--profile->free_count];
+	sample = &profile->samples[index];
+	memset(sample, 0, sizeof(*sample));
+	sample->sq_staged_tsc = now_tsc;
+	sample->polls_at_submit = pqpair->stat ? pqpair->stat->polls : 0;
+	sample->idle_polls_at_submit = pqpair->stat ? pqpair->stat->idle_polls : 0;
+	sample->completions_at_submit = pqpair->stat ? pqpair->stat->completions : 0;
+	sample->cid = cid;
+	sample->qd_at_submit = pqpair->qpair.queue_depth;
+	sample->active = true;
+	sample->pending_doorbell = true;
+	profile->sample_by_cid[cid] = index;
+	profile->pending[profile->pending_count++] = index;
+	return sample;
+}
+
+static void
+xds_nvme_pcie_profile_release(struct xds_nvme_pcie_profile *profile,
+			      struct xds_nvme_pcie_sample *sample)
+{
+	ptrdiff_t index;
+
+	if (!profile || !sample || !sample->active) {
+		return;
+	}
+	index = sample - profile->samples;
+	if (index < 0 || index >= XDS_NVME_PCIE_SAMPLE_POOL_SIZE ||
+	    profile->free_count >= XDS_NVME_PCIE_SAMPLE_POOL_SIZE) {
+		profile->invalid++;
+		return;
+	}
+	if (sample->cid < UINT16_MAX) {
+		profile->sample_by_cid[sample->cid] = -1;
+	}
+	sample->active = false;
+	sample->pending_doorbell = false;
+	profile->free_stack[profile->free_count++] = (uint8_t)index;
+}
+
+static void
+xds_nvme_pcie_profile_mark_doorbell_at(struct nvme_pcie_qpair *pqpair,
+				       uint64_t now_tsc)
+{
+	struct xds_nvme_pcie_profile *profile;
+	struct xds_nvme_pcie_sample *sample;
+	uint8_t i;
+	uint8_t index;
+
+	if (!pqpair || !pqpair->flags.xds_profile_enabled || !pqpair->xds_profile) {
+		return;
+	}
+	profile = pqpair->xds_profile;
+	for (i = 0; i < profile->pending_count; i++) {
+		index = profile->pending[i];
+		sample = &profile->samples[index];
+		if (!sample->active || !sample->pending_doorbell) {
+			continue;
+		}
+		sample->doorbell_tsc = now_tsc;
+		sample->pending_doorbell = false;
+	}
+	profile->pending_count = 0;
+}
+
+static int
+xds_nvme_pcie_profile_complete_at(struct nvme_pcie_qpair *pqpair, uint16_t cid,
+				  bool error, uint64_t now_tsc)
+{
+	struct xds_nvme_pcie_profile *profile;
+	struct xds_nvme_pcie_sample *sample;
+	uint64_t latency_ticks;
+	uint64_t polls_delta = 0;
+	uint64_t idle_polls_delta = 0;
+	uint64_t completions_delta = 0;
+	int16_t index;
+
+	if (!pqpair || !pqpair->flags.xds_profile_enabled || !pqpair->xds_profile) {
+		return -ENOENT;
+	}
+	profile = pqpair->xds_profile;
+	if (cid >= pqpair->num_entries || profile->sample_by_cid[cid] < 0) {
+		return -ENOENT;
+	}
+	index = profile->sample_by_cid[cid];
+	sample = &profile->samples[index];
+	if (!sample->active || sample->cid != cid) {
+		profile->invalid++;
+		xds_nvme_pcie_profile_release(profile, sample);
+		return -EINVAL;
+	}
+	if (error) {
+		profile->error_drops++;
+		xds_nvme_pcie_profile_release(profile, sample);
+		return -EIO;
+	}
+	if (sample->sq_staged_tsc == 0 || sample->doorbell_tsc == 0 ||
+	    sample->doorbell_tsc < sample->sq_staged_tsc ||
+	    now_tsc < sample->doorbell_tsc ||
+	    (pqpair->stat &&
+	     (pqpair->stat->polls < sample->polls_at_submit ||
+	      pqpair->stat->idle_polls < sample->idle_polls_at_submit ||
+	      pqpair->stat->completions < sample->completions_at_submit))) {
+		profile->invalid++;
+		xds_nvme_pcie_profile_release(profile, sample);
+		return -EINVAL;
+	}
+
+	latency_ticks = now_tsc - sample->doorbell_tsc;
+	if (pqpair->stat) {
+		polls_delta = pqpair->stat->polls - sample->polls_at_submit;
+		idle_polls_delta = pqpair->stat->idle_polls -
+				   sample->idle_polls_at_submit;
+		completions_delta = pqpair->stat->completions -
+				    sample->completions_at_submit;
+	}
+	if (latency_ticks > profile->latency_max_ticks) {
+		profile->latency_max_ticks = latency_ticks;
+		profile->latency_max_polls = polls_delta;
+		profile->latency_max_idle_polls = idle_polls_delta;
+		profile->latency_max_completions = completions_delta;
+		profile->latency_max_qd_submit = sample->qd_at_submit;
+		profile->latency_max_qd_cqe = pqpair->qpair.queue_depth;
+	}
+
+	profile->completed++;
+	profile->sq_wait_ticks += sample->doorbell_tsc - sample->sq_staged_tsc;
+	profile->doorbell_to_cqe_ticks += latency_ticks;
+	profile->total_ticks += now_tsc - sample->sq_staged_tsc;
+	if (profile->latency_stored < XDS_NVME_PCIE_LATENCY_RESERVOIR_SIZE) {
+		profile->latency_ticks[profile->latency_stored++] =
+			latency_ticks;
+	}
+	if (pqpair->stat) {
+		profile->polls_delta += polls_delta;
+		profile->idle_polls_delta += idle_polls_delta;
+		profile->completions_delta += completions_delta;
+	}
+	profile->qd_submit_sum += sample->qd_at_submit;
+	profile->qd_cqe_sum += pqpair->qpair.queue_depth;
+	xds_nvme_pcie_profile_release(profile, sample);
+	return 0;
+}
+
+static int
+xds_nvme_pcie_latency_compare(const void *left, const void *right)
+{
+	const uint64_t a = *(const uint64_t *)left;
+	const uint64_t b = *(const uint64_t *)right;
+
+	return (a > b) - (a < b);
+}
+
+static uint64_t
+xds_nvme_pcie_latency_percentile(const struct xds_nvme_pcie_profile *profile,
+				 uint32_t percentile)
+{
+	uint64_t rank;
+
+	if (!profile || profile->latency_stored == 0 || percentile == 0 ||
+	    percentile > 100) {
+		return 0;
+	}
+	rank = ((uint64_t)percentile * profile->latency_stored + 99) / 100;
+	return profile->latency_ticks[rank - 1];
+}
+
+static uint64_t
+xds_nvme_pcie_latency_count_over(const struct xds_nvme_pcie_profile *profile,
+				 uint64_t ticks_hz, double threshold_us)
+{
+	uint64_t count = 0;
+	uint64_t i;
+
+	for (i = 0; i < profile->latency_stored; i++) {
+		if ((double)profile->latency_ticks[i] * 1000000.0 /
+		    (double)ticks_hz > threshold_us) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static int
+xds_nvme_pcie_profile_latency_format(
+	char *buf, size_t buf_size, const char *traddr, uint32_t core, uint16_t qid,
+	struct xds_nvme_pcie_profile *profile, uint64_t ticks_hz)
+{
+	double divisor;
+	uint64_t p50;
+	uint64_t p95;
+	uint64_t p99;
+	uint64_t max;
+	uint64_t over_100us;
+	uint64_t over_1000us;
+	uint64_t over_10000us;
+
+	if (!buf || buf_size == 0 || !traddr || !profile ||
+	    !profile->latency_ticks || profile->latency_stored == 0 ||
+	    ticks_hz == 0) {
+		return -EINVAL;
+	}
+	qsort(profile->latency_ticks, profile->latency_stored,
+	      sizeof(*profile->latency_ticks), xds_nvme_pcie_latency_compare);
+	p50 = xds_nvme_pcie_latency_percentile(profile, 50);
+	p95 = xds_nvme_pcie_latency_percentile(profile, 95);
+	p99 = xds_nvme_pcie_latency_percentile(profile, 99);
+	max = profile->latency_ticks[profile->latency_stored - 1];
+	over_100us = xds_nvme_pcie_latency_count_over(profile, ticks_hz, 100.0);
+	over_1000us = xds_nvme_pcie_latency_count_over(profile, ticks_hz, 1000.0);
+	over_10000us = xds_nvme_pcie_latency_count_over(profile, ticks_hz, 10000.0);
+	divisor = (double)ticks_hz;
+
+	return snprintf(buf, buf_size,
+			"XDS_NVME_PCIE_LATENCY_PROFILE traddr=%s core=%u qid=%u "
+			"samples=%" PRIu64 " stored=%" PRIu64 " truncated=%" PRIu64 " "
+			"doorbell_to_cqe_p50_us=%.3f doorbell_to_cqe_p95_us=%.3f "
+			"doorbell_to_cqe_p99_us=%.3f doorbell_to_cqe_max_us=%.3f "
+			"over_100us=%" PRIu64 " over_1000us=%" PRIu64 " "
+			"over_10000us=%" PRIu64 " max_polls=%" PRIu64 " "
+			"max_idle_polls=%" PRIu64 " max_completions=%" PRIu64 " "
+			"max_qd_submit=%u max_qd_cqe=%u",
+			traddr, core, qid, profile->completed, profile->latency_stored,
+			profile->completed - profile->latency_stored,
+			(double)p50 * 1000000.0 / divisor,
+			(double)p95 * 1000000.0 / divisor,
+			(double)p99 * 1000000.0 / divisor,
+			(double)max * 1000000.0 / divisor,
+			over_100us, over_1000us, over_10000us,
+			profile->latency_max_polls,
+			profile->latency_max_idle_polls,
+			profile->latency_max_completions,
+			profile->latency_max_qd_submit,
+			profile->latency_max_qd_cqe);
+}
+
+static int
+xds_nvme_pcie_profile_format(char *buf, size_t buf_size, const char *traddr,
+			     uint32_t core, uint16_t qid,
+			     const struct xds_nvme_pcie_profile *profile,
+			     uint64_t ticks_hz)
+{
+	double tick_divisor;
+	double sample_divisor;
+	double qd_tick_divisor;
+	uint64_t qd_total_ticks = 0;
+	uint32_t i;
+
+	if (!buf || buf_size == 0 || !traddr || !profile ||
+	    profile->completed == 0 || ticks_hz == 0) {
+		return -EINVAL;
+	}
+	tick_divisor = (double)ticks_hz * (double)profile->completed;
+	sample_divisor = (double)profile->completed;
+	for (i = 0; i < SPDK_COUNTOF(profile->qd_residency_ticks); i++) {
+		qd_total_ticks += profile->qd_residency_ticks[i];
+	}
+	qd_tick_divisor = qd_total_ticks ? (double)qd_total_ticks : 1.0;
+
+	return snprintf(buf, buf_size,
+			"XDS_NVME_PCIE_STAGE_PROFILE traddr=%s core=%u qid=%u shift=%u "
+			"eligible=%" PRIu64 " samples=%" PRIu64 " pool_drops=%" PRIu64 " "
+			"error_drops=%" PRIu64 " invalid=%" PRIu64 " incomplete=%" PRIu64 " "
+			"sq_wait_us=%.3f doorbell_to_cqe_us=%.3f transport_total_us=%.3f "
+			"polls_per_sample=%.3f idle_polls_per_sample=%.3f "
+			"completions_per_sample=%.3f qd_submit=%.3f qd_cqe=%.3f "
+			"qd_time_0_pct=%.3f qd_time_1_7_pct=%.3f "
+			"qd_time_8_15_pct=%.3f qd_time_16_23_pct=%.3f "
+			"qd_time_24_27_pct=%.3f qd_time_28_31_pct=%.3f "
+			"qd_time_32_plus_pct=%.3f low_qd_episodes=%" PRIu64 " "
+			"low_qd_max_us=%.3f qd_time_total_us=%.3f",
+			traddr, core, qid, profile->shift, profile->eligible,
+			profile->completed, profile->pool_drops, profile->error_drops,
+			profile->invalid, profile->incomplete,
+			(double)profile->sq_wait_ticks * 1000000.0 / tick_divisor,
+			(double)profile->doorbell_to_cqe_ticks * 1000000.0 / tick_divisor,
+			(double)profile->total_ticks * 1000000.0 / tick_divisor,
+			(double)profile->polls_delta / sample_divisor,
+			(double)profile->idle_polls_delta / sample_divisor,
+			(double)profile->completions_delta / sample_divisor,
+			(double)profile->qd_submit_sum / sample_divisor,
+			(double)profile->qd_cqe_sum / sample_divisor,
+			(double)profile->qd_residency_ticks[0] * 100.0 / qd_tick_divisor,
+			(double)profile->qd_residency_ticks[1] * 100.0 / qd_tick_divisor,
+			(double)profile->qd_residency_ticks[2] * 100.0 / qd_tick_divisor,
+			(double)profile->qd_residency_ticks[3] * 100.0 / qd_tick_divisor,
+			(double)profile->qd_residency_ticks[4] * 100.0 / qd_tick_divisor,
+			(double)profile->qd_residency_ticks[5] * 100.0 / qd_tick_divisor,
+			(double)profile->qd_residency_ticks[6] * 100.0 / qd_tick_divisor,
+			profile->low_qd_episodes,
+			(double)profile->low_qd_max_ticks * 1000000.0 /
+			(double)ticks_hz,
+			(double)qd_total_ticks * 1000000.0 / (double)ticks_hz);
+}
+
+static void
+xds_nvme_pcie_profile_report(struct nvme_pcie_qpair *pqpair)
+{
+	struct xds_nvme_pcie_profile *profile = pqpair->xds_profile;
+	char line[1024];
+	uint32_t i;
+	int rc;
+
+	if (!profile) {
+		return;
+	}
+	xds_nvme_pcie_profile_qd_finalize_at(profile, spdk_get_ticks());
+	for (i = 0; i < XDS_NVME_PCIE_SAMPLE_POOL_SIZE; i++) {
+		if (profile->samples[i].active) {
+			profile->incomplete++;
+			profile->samples[i].active = false;
+		}
+	}
+	if (profile->eligible == 0 || profile->completed == 0) {
+		return;
+	}
+	rc = xds_nvme_pcie_profile_format(
+		line, sizeof(line), pqpair->qpair.ctrlr->trid.traddr,
+		spdk_env_get_current_core(), pqpair->qpair.id, profile,
+		spdk_get_ticks_hz());
+	if (rc > 0 && (size_t)rc < sizeof(line)) {
+		SPDK_NOTICELOG("%s\n", line);
+	}
+	rc = xds_nvme_pcie_profile_latency_format(
+		line, sizeof(line), pqpair->qpair.ctrlr->trid.traddr,
+		spdk_env_get_current_core(), pqpair->qpair.id, profile,
+		spdk_get_ticks_hz());
+	if (rc > 0 && (size_t)rc < sizeof(line)) {
+		SPDK_NOTICELOG("%s\n", line);
+	}
+}
+
+void
+nvme_pcie_xds_profile_mark_doorbell(struct spdk_nvme_qpair *qpair)
+{
+	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
+
+	if (!pqpair->xds_profile || pqpair->xds_profile->pending_count == 0) {
+		return;
+	}
+	xds_nvme_pcie_profile_mark_doorbell_at(pqpair, spdk_get_ticks());
 }
 
 static inline uint64_t
@@ -310,6 +961,16 @@ nvme_pcie_qpair_construct(struct spdk_nvme_qpair *qpair,
 		tr = &pqpair->tr[i];
 		nvme_qpair_construct_tracker(tr, i, nvme_pcie_vtophys(ctrlr, tr, NULL));
 		TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
+	}
+
+	if (!nvme_qpair_is_admin_queue(qpair)) {
+		int rc = xds_nvme_pcie_profile_init(
+			pqpair, getenv("XDS_NVME_STAGE_PROFILE_SHIFT"));
+
+		if (rc != 0) {
+			NVME_QPAIR_ERRLOG(qpair,
+				"Unable to enable XDS PCIe stage profiling: rc=%d\n", rc);
+		}
 	}
 
 	nvme_pcie_qpair_reset(qpair);
@@ -797,6 +1458,19 @@ nvme_pcie_qpair_complete_tracker(struct spdk_nvme_qpair *qpair, struct nvme_trac
 		nvme_pcie_qpair_submit_tracker(qpair, tr);
 	} else {
 		TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
+		if (spdk_unlikely(pqpair->flags.xds_profile_enabled)) {
+			uint64_t now_tsc = pqpair->xds_profile->qd_event_tsc;
+
+			if (now_tsc == 0) {
+				now_tsc = spdk_get_ticks();
+			}
+			xds_nvme_pcie_profile_qd_transition_at(
+				pqpair->xds_profile,
+				pqpair->qpair.queue_depth > 0 ?
+					pqpair->qpair.queue_depth - 1 : 0,
+				now_tsc);
+			pqpair->xds_profile->qd_event_tsc = 0;
+		}
 		pqpair->qpair.queue_depth--;
 
 		/* Only check admin requests from different processes. */
@@ -1016,6 +1690,14 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 
 		tr = &pqpair->tr[cpl->cid];
 		pqpair->sq_head = cpl->sqhd;
+		if (spdk_unlikely(pqpair->flags.xds_profile_enabled)) {
+			uint64_t now_tsc = spdk_get_ticks();
+
+			pqpair->xds_profile->qd_event_tsc = now_tsc;
+			(void)xds_nvme_pcie_profile_complete_at(
+				pqpair, cpl->cid, spdk_nvme_cpl_is_error(cpl),
+				now_tsc);
+		}
 
 		if (tr->req) {
 			/* Prefetch the req's STAILQ_ENTRY since we'll need to access it
@@ -1094,6 +1776,8 @@ nvme_pcie_qpair_destroy(struct spdk_nvme_qpair *qpair)
 	if (nvme_qpair_is_admin_queue(qpair)) {
 		nvme_pcie_admin_qpair_destroy(qpair);
 	}
+	xds_nvme_pcie_profile_report(pqpair);
+	xds_nvme_pcie_profile_fini(pqpair);
 	/*
 	 * We check sq_vaddr and cq_vaddr to see if the user specified the memory
 	 * buffers when creating the I/O queue.
@@ -1739,6 +2423,7 @@ nvme_pcie_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	bool			sgl_supported;
 	bool			mptr_sgl_supported;
 	bool			dword_aligned = true;
+	uint64_t		profile_submit_tsc = 0;
 
 	if (spdk_unlikely(nvme_qpair_is_admin_queue(qpair))) {
 		nvme_ctrlr_lock(ctrlr);
@@ -1757,6 +2442,12 @@ nvme_pcie_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	TAILQ_REMOVE(&pqpair->free_tr, tr, tq_list); /* remove tr from free_tr */
 	TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
 	pqpair->qpair.queue_depth++;
+	if (spdk_unlikely(pqpair->flags.xds_profile_enabled)) {
+		profile_submit_tsc = spdk_get_ticks();
+		xds_nvme_pcie_profile_qd_transition_at(
+			pqpair->xds_profile, pqpair->qpair.queue_depth,
+			profile_submit_tsc);
+	}
 	tr->req = req;
 	tr->cb_fn = req->cb_fn;
 	tr->cb_arg = req->cb_arg;
@@ -1805,6 +2496,10 @@ nvme_pcie_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		}
 	}
 
+	if (spdk_unlikely(pqpair->flags.xds_profile_enabled)) {
+		(void)xds_nvme_pcie_profile_try_begin(pqpair, tr->cid,
+			profile_submit_tsc);
+	}
 	nvme_pcie_qpair_submit_tracker(qpair, tr);
 
 exit:

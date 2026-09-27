@@ -7,7 +7,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += hello_world bdevperf
+DIRS-y += hello_world bdevperf chunk_pipeline
 
 .PHONY: all clean $(DIRS-y)
 

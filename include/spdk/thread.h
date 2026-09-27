@@ -604,6 +604,21 @@ struct spdk_poller *spdk_poller_register(spdk_poller_fn fn,
 		uint64_t period_microseconds);
 
 /**
+ * Register a zero-period poller that runs after default active pollers.
+ *
+ * This is intended for low-priority refill or bookkeeping work that must run
+ * once per thread poll without delaying completion-producing pollers.
+ *
+ * \param fn Function called once per thread poll.
+ * \param arg Argument passed to fn.
+ *
+ * \return a pointer to the poller registered on the current thread on success
+ * or NULL on failure.
+ */
+struct spdk_poller *spdk_poller_register_low_priority(spdk_poller_fn fn,
+		void *arg);
+
+/**
  * Register a poller on the current thread with arbitrary name.
  *
  * The poller can be unregistered by calling spdk_poller_unregister().

@@ -81,6 +81,7 @@ struct spdk_poller {
 	uint64_t			run_count;
 	uint64_t			busy_count;
 	uint64_t			id;
+	bool				low_priority;
 	spdk_poller_fn			fn;
 	void				*arg;
 	struct spdk_thread		*thread;
@@ -957,6 +958,9 @@ thread_insert_poller(struct spdk_thread *thread, struct spdk_poller *poller)
 {
 	if (poller->period_ticks) {
 		poller_insert_timer(thread, poller, spdk_get_ticks());
+	} else if (poller->low_priority) {
+		/* Active pollers execute in reverse list order. */
+		TAILQ_INSERT_HEAD(&thread->active_pollers, poller, tailq);
 	} else {
 		TAILQ_INSERT_TAIL(&thread->active_pollers, poller, tailq);
 	}
@@ -1706,7 +1710,8 @@ static struct spdk_poller *
 poller_register(spdk_poller_fn fn,
 		void *arg,
 		uint64_t period_microseconds,
-		const char *name)
+		const char *name,
+		bool low_priority)
 {
 	struct spdk_thread *thread;
 	struct spdk_poller *poller;
@@ -1738,6 +1743,7 @@ poller_register(spdk_poller_fn fn,
 	poller->fn = fn;
 	poller->arg = arg;
 	poller->thread = thread;
+	poller->low_priority = low_priority;
 	poller->intr = NULL;
 	if (thread->next_poller_id == 0) {
 		SPDK_WARNLOG("Poller ID rolled over. Poller ID is duplicated.\n");
@@ -1792,7 +1798,13 @@ spdk_poller_register(spdk_poller_fn fn,
 		     void *arg,
 		     uint64_t period_microseconds)
 {
-	return poller_register(fn, arg, period_microseconds, NULL);
+	return poller_register(fn, arg, period_microseconds, NULL, false);
+}
+
+struct spdk_poller *
+spdk_poller_register_low_priority(spdk_poller_fn fn, void *arg)
+{
+	return poller_register(fn, arg, 0, NULL, true);
 }
 
 struct spdk_poller *
@@ -1801,7 +1813,7 @@ spdk_poller_register_named(spdk_poller_fn fn,
 			   uint64_t period_microseconds,
 			   const char *name)
 {
-	return poller_register(fn, arg, period_microseconds, name);
+	return poller_register(fn, arg, period_microseconds, name, false);
 }
 
 static void

@@ -137,6 +137,9 @@ struct nvme_bdev_io {
 	/* Current tsc at submit time. */
 	uint64_t submit_tsc;
 
+	/* Optional low-rate NVMe child stage sample. */
+	struct xds_nvme_stage_sample *xds_stage_sample;
+
 	/* Used to put nvme_bdev_io into the list */
 	TAILQ_ENTRY(nvme_bdev_io) retry_link;
 };
@@ -203,6 +206,358 @@ struct spdk_thread *g_bdev_nvme_init_thread;
 static struct spdk_poller *g_hotplug_poller;
 static struct spdk_poller *g_hotplug_probe_poller;
 static struct spdk_nvme_probe_ctx *g_hotplug_probe_ctx;
+static bool g_xds_nvme_stage_profile_enabled;
+static uint8_t g_xds_nvme_stage_profile_shift;
+static bool g_xds_nvme_poll_profile_enabled;
+
+static int
+xds_nvme_parse_poll_profile(const char *value, bool *enabled)
+{
+	if (!value) {
+		return -ENOENT;
+	}
+	if (!enabled) {
+		return -EINVAL;
+	}
+	if (strcmp(value, "0") == 0) {
+		*enabled = false;
+		return 0;
+	}
+	if (strcmp(value, "1") == 0) {
+		*enabled = true;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int
+xds_nvme_stage_profile_parse_shift(const char *value, uint8_t *shift)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (!value) {
+		return -ENOENT;
+	}
+	if (!shift || value[0] == '\0' || value[0] == '-') {
+		return -EINVAL;
+	}
+
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0') {
+		return -EINVAL;
+	}
+	if (parsed > 63) {
+		return -ERANGE;
+	}
+
+	*shift = (uint8_t)parsed;
+	return 0;
+}
+
+static int
+xds_nvme_stage_profile_channel_init(struct xds_nvme_stage_profile_channel *profile,
+				    uint8_t shift)
+{
+	uint32_t i;
+
+	if (!profile || shift > 63) {
+		return -EINVAL;
+	}
+
+	memset(profile, 0, sizeof(*profile));
+	profile->pool = calloc(XDS_NVME_STAGE_SAMPLE_POOL_SIZE,
+			       sizeof(*profile->pool));
+	if (!profile->pool) {
+		return -ENOMEM;
+	}
+	profile->shift = shift;
+	profile->sample_mask = shift == 0 ? 0 : (UINT64_C(1) << shift) - 1;
+	profile->free_count = XDS_NVME_STAGE_SAMPLE_POOL_SIZE;
+	for (i = 0; i < XDS_NVME_STAGE_SAMPLE_POOL_SIZE; i++) {
+		profile->free_stack[i] = (uint8_t)i;
+	}
+	return 0;
+}
+
+static void
+xds_nvme_stage_profile_channel_fini(struct xds_nvme_stage_profile_channel *profile)
+{
+	if (!profile) {
+		return;
+	}
+	free(profile->pool);
+	profile->pool = NULL;
+	profile->free_count = 0;
+}
+
+static struct xds_nvme_stage_sample *
+xds_nvme_stage_profile_try_alloc(struct xds_nvme_stage_profile_channel *profile,
+				 uint64_t bdev_submit_tsc,
+				 uint64_t module_entry_tsc)
+{
+	struct xds_nvme_stage_sample *sample;
+	uint64_t sequence;
+	uint8_t index;
+
+	if (!profile || !profile->pool) {
+		return NULL;
+	}
+
+	profile->acc.eligible++;
+	sequence = profile->sequence++;
+	if ((sequence & profile->sample_mask) != 0) {
+		return NULL;
+	}
+	if (profile->free_count == 0) {
+		profile->acc.pool_drops++;
+		return NULL;
+	}
+
+	index = profile->free_stack[--profile->free_count];
+	sample = &profile->pool[index];
+	memset(sample, 0, sizeof(*sample));
+	sample->bdev_submit_tsc = bdev_submit_tsc;
+	sample->module_entry_tsc = module_entry_tsc;
+	sample->owner = profile;
+	sample->active = true;
+	return sample;
+}
+
+static void
+xds_nvme_stage_profile_release(struct xds_nvme_stage_profile_channel *profile,
+			       struct xds_nvme_stage_sample *sample)
+{
+	ptrdiff_t index;
+
+	if (!profile || !profile->pool || !sample) {
+		return;
+	}
+	index = sample - profile->pool;
+	if (index < 0 || index >= XDS_NVME_STAGE_SAMPLE_POOL_SIZE ||
+	    !sample->active ||
+	    profile->free_count >= XDS_NVME_STAGE_SAMPLE_POOL_SIZE) {
+		profile->acc.invalid++;
+		return;
+	}
+
+	sample->active = false;
+	profile->free_stack[profile->free_count++] = (uint8_t)index;
+}
+
+static int
+xds_nvme_stage_profile_finish(struct xds_nvme_stage_profile_channel *profile,
+			      struct xds_nvme_stage_sample *sample)
+{
+	if (!profile || !sample ||
+	    sample->bdev_submit_tsc == 0 ||
+	    sample->module_entry_tsc < sample->bdev_submit_tsc ||
+	    sample->path_done_tsc < sample->module_entry_tsc ||
+	    sample->cmd_submit_done_tsc < sample->path_done_tsc ||
+	    sample->nvme_callback_tsc < sample->cmd_submit_done_tsc ||
+	    sample->bdev_complete_tsc < sample->nvme_callback_tsc) {
+		if (profile) {
+			profile->acc.invalid++;
+			xds_nvme_stage_profile_release(profile, sample);
+		}
+		return -EINVAL;
+	}
+
+	profile->acc.samples++;
+	profile->acc.bdev_dispatch_ticks +=
+		sample->module_entry_tsc - sample->bdev_submit_tsc;
+	profile->acc.path_select_ticks +=
+		sample->path_done_tsc - sample->module_entry_tsc;
+	profile->acc.cmd_submit_ticks +=
+		sample->cmd_submit_done_tsc - sample->path_done_tsc;
+	profile->acc.device_wait_ticks +=
+		sample->nvme_callback_tsc - sample->cmd_submit_done_tsc;
+	profile->acc.completion_ticks +=
+		sample->bdev_complete_tsc - sample->nvme_callback_tsc;
+	profile->acc.total_ticks +=
+		sample->bdev_complete_tsc - sample->bdev_submit_tsc;
+	xds_nvme_stage_profile_release(profile, sample);
+	return 0;
+}
+
+enum xds_nvme_stage_drop_reason {
+	XDS_NVME_STAGE_DROP_RETRY,
+	XDS_NVME_STAGE_DROP_ERROR,
+};
+
+static void
+xds_nvme_stage_profile_drop(struct nvme_bdev_io *bio,
+			    enum xds_nvme_stage_drop_reason reason)
+{
+	struct xds_nvme_stage_sample *sample;
+	struct xds_nvme_stage_profile_channel *profile;
+
+	if (!bio || !bio->xds_stage_sample) {
+		return;
+	}
+	sample = bio->xds_stage_sample;
+	bio->xds_stage_sample = NULL;
+	profile = sample->owner;
+	if (reason == XDS_NVME_STAGE_DROP_RETRY) {
+		profile->acc.retry_drops++;
+	} else {
+		profile->acc.error_drops++;
+	}
+	xds_nvme_stage_profile_release(profile, sample);
+}
+
+static void
+xds_nvme_stage_profile_complete(struct nvme_bdev_io *bio)
+{
+	struct xds_nvme_stage_sample *sample;
+	struct xds_nvme_stage_profile_channel *profile;
+
+	if (!bio || !bio->xds_stage_sample) {
+		return;
+	}
+	sample = bio->xds_stage_sample;
+	bio->xds_stage_sample = NULL;
+	profile = sample->owner;
+	sample->bdev_complete_tsc = spdk_get_ticks();
+	(void)xds_nvme_stage_profile_finish(profile, sample);
+}
+
+static int
+xds_nvme_stage_profile_format(char *buf, size_t buf_size, const char *bdev_name,
+			      uint32_t core,
+			      const struct xds_nvme_stage_profile_channel *profile,
+			      uint64_t tick_rate)
+{
+	const struct xds_nvme_stage_accumulator *acc;
+	uint64_t stage_sum, closure_diff;
+	double divisor, closure_error_pct;
+	int rc;
+
+	if (!buf || buf_size == 0 || !bdev_name || !profile ||
+	    tick_rate == 0 || profile->acc.samples == 0) {
+		return -EINVAL;
+	}
+	acc = &profile->acc;
+	divisor = (double)tick_rate * (double)acc->samples;
+	stage_sum = acc->bdev_dispatch_ticks + acc->path_select_ticks +
+		    acc->cmd_submit_ticks + acc->device_wait_ticks +
+		    acc->completion_ticks;
+	closure_diff = stage_sum > acc->total_ticks ?
+		       stage_sum - acc->total_ticks : acc->total_ticks - stage_sum;
+	closure_error_pct = acc->total_ticks == 0 ? 0.0 :
+		(double)closure_diff * 100.0 / (double)acc->total_ticks;
+
+	rc = snprintf(buf, buf_size,
+		      "XDS_NVME_STAGE_PROFILE bdev=%s core=%u shift=%u "
+		      "eligible=%" PRIu64 " samples=%" PRIu64 " "
+		      "pool_drops=%" PRIu64 " retry_drops=%" PRIu64 " "
+		      "error_drops=%" PRIu64 " invalid=%" PRIu64 " "
+		      "bdev_dispatch_us=%.3f path_select_us=%.3f "
+		      "cmd_submit_us=%.3f device_wait_us=%.3f "
+		      "completion_us=%.3f total_us=%.3f "
+		      "closure_error_pct=%.3f",
+		      bdev_name, core, profile->shift, acc->eligible, acc->samples,
+		      acc->pool_drops, acc->retry_drops, acc->error_drops,
+		      acc->invalid,
+		      (double)acc->bdev_dispatch_ticks * 1000000.0 / divisor,
+		      (double)acc->path_select_ticks * 1000000.0 / divisor,
+		      (double)acc->cmd_submit_ticks * 1000000.0 / divisor,
+		      (double)acc->device_wait_ticks * 1000000.0 / divisor,
+		      (double)acc->completion_ticks * 1000000.0 / divisor,
+		      (double)acc->total_ticks * 1000000.0 / divisor,
+		      closure_error_pct);
+	if (rc < 0) {
+		return rc;
+	}
+	if ((size_t)rc >= buf_size) {
+		return -ENOSPC;
+	}
+	return rc;
+}
+
+static int
+xds_nvme_poll_profile_record_batch(
+	struct xds_nvme_completion_batch_profile *profile,
+	int64_t completions)
+{
+	uint32_t bucket;
+
+	if (!profile || completions <= 0) {
+		return -EINVAL;
+	}
+	if (completions == 1) {
+		bucket = 0;
+	} else if (completions == 2) {
+		bucket = 1;
+	} else if (completions <= 4) {
+		bucket = 2;
+	} else if (completions <= 8) {
+		bucket = 3;
+	} else if (completions <= 16) {
+		bucket = 4;
+	} else if (completions <= 32) {
+		bucket = 5;
+	} else {
+		bucket = 6;
+	}
+	profile->bins[bucket]++;
+	if ((uint64_t)completions > profile->max_completions) {
+		profile->max_completions = (uint64_t)completions;
+	}
+	return 0;
+}
+
+static int
+xds_nvme_poll_profile_format(char *buf, size_t buf_size, uint32_t core,
+			     const struct spdk_nvme_pcie_stat *stat,
+			     const struct xds_nvme_completion_batch_profile *batch)
+{
+	uint64_t active_polls;
+	double completions_per_active_poll;
+	int rc;
+
+	if (!buf || buf_size == 0 || !stat || !batch) {
+		return -EINVAL;
+	}
+	active_polls = stat->polls >= stat->idle_polls ?
+		       stat->polls - stat->idle_polls : 0;
+	completions_per_active_poll = active_polls == 0 ? 0.0 :
+		(double)stat->completions / (double)active_polls;
+	rc = snprintf(buf, buf_size,
+			"XDS_NVME_POLL_PROFILE core=%u polls=%" PRIu64 " "
+			"idle_polls=%" PRIu64 " completions=%" PRIu64 " "
+			"active_polls=%" PRIu64 " "
+			"completions_per_active_poll=%.3f "
+			"submitted=%" PRIu64 " queued=%" PRIu64 " "
+			"sq_mmio=%" PRIu64 " sq_shadow=%" PRIu64 " "
+			"cq_mmio=%" PRIu64 " cq_shadow=%" PRIu64 " "
+			"completion_batch_1=%" PRIu64 " "
+			"completion_batch_2=%" PRIu64 " "
+			"completion_batch_3_4=%" PRIu64 " "
+			"completion_batch_5_8=%" PRIu64 " "
+			"completion_batch_9_16=%" PRIu64 " "
+			"completion_batch_17_32=%" PRIu64 " "
+			"completion_batch_33_plus=%" PRIu64 " "
+			"completion_batch_max=%" PRIu64,
+			core, stat->polls, stat->idle_polls, stat->completions,
+			active_polls, completions_per_active_poll,
+			stat->submitted_requests, stat->queued_requests,
+			stat->sq_mmio_doorbell_updates,
+			stat->sq_shadow_doorbell_updates,
+			stat->cq_mmio_doorbell_updates,
+			stat->cq_shadow_doorbell_updates,
+			batch->bins[0], batch->bins[1], batch->bins[2],
+			batch->bins[3], batch->bins[4], batch->bins[5],
+			batch->bins[6], batch->max_completions);
+	if (rc < 0) {
+		return rc;
+	}
+	if ((size_t)rc >= buf_size) {
+		return -ENOSPC;
+	}
+	return rc;
+}
 
 static void nvme_ctrlr_populate_namespaces(struct nvme_ctrlr *nvme_ctrlr,
 		struct nvme_async_probe_ctx *ctx);
@@ -1000,6 +1355,18 @@ bdev_nvme_create_bdev_channel_cb(void *io_device, void *ctx_buf)
 	}
 	pthread_mutex_unlock(&nbdev->mutex);
 
+	if (g_xds_nvme_stage_profile_enabled) {
+		nbdev_ch->xds_stage_profile = calloc(1, sizeof(*nbdev_ch->xds_stage_profile));
+		if (!nbdev_ch->xds_stage_profile ||
+		    xds_nvme_stage_profile_channel_init(nbdev_ch->xds_stage_profile,
+						g_xds_nvme_stage_profile_shift) != 0) {
+			SPDK_ERRLOG("NVMe stage profiler disabled for bdev %s channel: allocation failed\n",
+				    BDEV_STRING(nbdev));
+			free(nbdev_ch->xds_stage_profile);
+			nbdev_ch->xds_stage_profile = NULL;
+		}
+	}
+
 	return 0;
 }
 
@@ -1025,9 +1392,33 @@ static void
 bdev_nvme_destroy_bdev_channel_cb(void *io_device, void *ctx_buf)
 {
 	struct nvme_bdev_channel *nbdev_ch = ctx_buf;
+	struct nvme_bdev *nbdev = io_device;
+	struct xds_nvme_stage_profile_channel *profile = nbdev_ch->xds_stage_profile;
+	char line[1024];
+	uint32_t i;
+	int rc;
 
 	bdev_nvme_abort_retry_ios(nbdev_ch);
 	_bdev_nvme_delete_io_paths(nbdev_ch);
+	if (!profile) {
+		return;
+	}
+	for (i = 0; i < XDS_NVME_STAGE_SAMPLE_POOL_SIZE; i++) {
+		if (profile->pool[i].active) {
+			profile->acc.invalid++;
+		}
+	}
+	if (profile->acc.eligible != 0 && profile->acc.samples != 0) {
+		rc = xds_nvme_stage_profile_format(line, sizeof(line), BDEV_STRING(nbdev),
+					   spdk_env_get_current_core(), profile,
+					   spdk_get_ticks_hz());
+		if (rc > 0) {
+			SPDK_NOTICELOG("%s\n", line);
+		}
+	}
+	xds_nvme_stage_profile_channel_fini(profile);
+	free(profile);
+	nbdev_ch->xds_stage_profile = NULL;
 }
 
 static inline bool
@@ -1621,11 +2012,17 @@ bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 	nbdev_ch = spdk_io_channel_get_ctx(spdk_bdev_io_get_io_channel(bdev_io));
 
 	if (bdev_nvme_check_retry_io(bio, cpl, nbdev_ch, &delay_ms)) {
+		xds_nvme_stage_profile_drop(bio, XDS_NVME_STAGE_DROP_RETRY);
 		bdev_nvme_queue_retry_io(nbdev_ch, bio, delay_ms);
 		return;
 	}
 
 complete:
+	if (spdk_nvme_cpl_is_success(cpl)) {
+		xds_nvme_stage_profile_complete(bio);
+	} else {
+		xds_nvme_stage_profile_drop(bio, XDS_NVME_STAGE_DROP_ERROR);
+	}
 	bdev_io->u.bdev.accel_sequence = NULL;
 	__bdev_nvme_io_complete(bdev_io, 0, cpl);
 }
@@ -1638,6 +2035,7 @@ bdev_nvme_io_complete(struct nvme_bdev_io *bio, int rc)
 	enum spdk_bdev_io_status io_status;
 
 	assert(!bdev_nvme_io_type_is_admin(bdev_io->type));
+	xds_nvme_stage_profile_drop(bio, XDS_NVME_STAGE_DROP_ERROR);
 
 	switch (rc) {
 	case 0:
@@ -1847,10 +2245,9 @@ bdev_nvme_check_io_qpairs(struct nvme_poll_group *group)
 	}
 }
 
-static int
-bdev_nvme_poll(void *arg)
+static inline int64_t
+bdev_nvme_poll_process(struct nvme_poll_group *group)
 {
-	struct nvme_poll_group *group = arg;
 	int64_t num_completions;
 
 	if (group->collect_spin_stat && group->start_ticks == 0) {
@@ -1874,7 +2271,27 @@ bdev_nvme_poll(void *arg)
 	if (spdk_unlikely(num_completions < 0)) {
 		bdev_nvme_check_io_qpairs(group);
 	}
+	return num_completions;
+}
 
+static int
+bdev_nvme_poll(void *arg)
+{
+	int64_t num_completions = bdev_nvme_poll_process(arg);
+
+	return num_completions > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+static int
+bdev_nvme_poll_profile(void *arg)
+{
+	struct nvme_poll_group *group = arg;
+	int64_t num_completions = bdev_nvme_poll_process(group);
+
+	if (num_completions > 0) {
+		(void)xds_nvme_poll_profile_record_batch(
+			&group->xds_completion_batch_profile, num_completions);
+	}
 	return num_completions > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
@@ -3496,6 +3913,7 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 {
 	struct nvme_bdev_channel *nbdev_ch = spdk_io_channel_get_ctx(ch);
 	struct nvme_bdev_io *nbdev_io = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	uint64_t module_entry_tsc;
 
 	if (spdk_likely(nbdev_io->submit_tsc == 0)) {
 		nbdev_io->submit_tsc = spdk_bdev_io_get_submit_tsc(bdev_io);
@@ -3503,7 +3921,17 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		/* There are cases where submit_tsc != 0, i.e. retry I/O.
 		 * We need to update submit_tsc here.
 		 */
-		nbdev_io->submit_tsc = spdk_get_ticks();
+		 nbdev_io->submit_tsc = spdk_get_ticks();
+	}
+	if (nbdev_ch->xds_stage_profile &&
+	    bdev_io->type == SPDK_BDEV_IO_TYPE_READ &&
+	    nbdev_io->retry_count == 0 &&
+	    bdev_io->u.bdev.iovs &&
+	    bdev_io->u.bdev.iovs[0].iov_base) {
+		module_entry_tsc = spdk_get_ticks();
+		nbdev_io->xds_stage_sample = xds_nvme_stage_profile_try_alloc(
+			nbdev_ch->xds_stage_profile, nbdev_io->submit_tsc,
+			module_entry_tsc);
 	}
 
 	spdk_trace_record(TRACE_BDEV_NVME_IO_START, 0, 0, (uintptr_t)nbdev_io, (uintptr_t)bdev_io);
@@ -3517,6 +3945,9 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		/* Admin commands do not use the optimal I/O path.
 		 * Simply fall through even if it is not found.
 		 */
+	}
+	if (nbdev_io->xds_stage_sample) {
+		nbdev_io->xds_stage_sample->path_done_tsc = spdk_get_ticks();
 	}
 
 	_bdev_nvme_submit_request(nbdev_ch, bdev_io);
@@ -3532,6 +3963,7 @@ bdev_nvme_submit_request_initial(struct spdk_io_channel *ch, struct spdk_bdev_io
 	 */
 	nbdev_io->submit_tsc = 0;
 	nbdev_io->retry_count = 0;
+	nbdev_io->xds_stage_sample = NULL;
 
 	bdev_nvme_submit_request(ch, bdev_io);
 }
@@ -3846,6 +4278,12 @@ bdev_nvme_poll_group_interrupt_cb(struct spdk_nvme_poll_group *group, void *ctx)
 	bdev_nvme_poll(ctx);
 }
 
+static void
+bdev_nvme_poll_group_profile_interrupt_cb(struct spdk_nvme_poll_group *group, void *ctx)
+{
+	bdev_nvme_poll_profile(ctx);
+}
+
 static int
 bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 {
@@ -3862,7 +4300,11 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 	}
 
 	period = spdk_interrupt_mode_is_enabled() ? 0 : g_opts.nvme_ioq_poll_period_us;
-	group->poller = SPDK_POLLER_REGISTER(bdev_nvme_poll, group, period);
+	if (g_xds_nvme_poll_profile_enabled) {
+		group->poller = SPDK_POLLER_REGISTER(bdev_nvme_poll_profile, group, period);
+	} else {
+		group->poller = SPDK_POLLER_REGISTER(bdev_nvme_poll, group, period);
+	}
 
 	if (group->poller == NULL) {
 		spdk_nvme_poll_group_destroy(group->group);
@@ -3878,8 +4320,15 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 			return -1;
 		}
 
-		rc = spdk_nvme_poll_group_set_interrupt_callback(group->group,
-				bdev_nvme_poll_group_interrupt_cb, group);
+		if (g_xds_nvme_poll_profile_enabled) {
+			rc = spdk_nvme_poll_group_set_interrupt_callback(
+				     group->group,
+				     bdev_nvme_poll_group_profile_interrupt_cb, group);
+		} else {
+			rc = spdk_nvme_poll_group_set_interrupt_callback(
+				     group->group,
+				     bdev_nvme_poll_group_interrupt_cb, group);
+		}
 		if (rc != 0) {
 			spdk_nvme_poll_group_destroy(group->group);
 			return -1;
@@ -3899,8 +4348,36 @@ static void
 bdev_nvme_destroy_poll_group_cb(void *io_device, void *ctx_buf)
 {
 	struct nvme_poll_group *group = ctx_buf;
+	struct spdk_nvme_poll_group_stat *stats = NULL;
+	struct spdk_nvme_transport_poll_group_stat *transport_stat;
+	char line[1024];
+	uint32_t i;
+	int rc;
 
 	assert(TAILQ_EMPTY(&group->qpair_list));
+	if (g_xds_nvme_stage_profile_enabled ||
+	    g_xds_nvme_poll_profile_enabled) {
+		rc = spdk_nvme_poll_group_get_stats(group->group, &stats);
+		if (rc == 0) {
+			for (i = 0; i < stats->num_transports; i++) {
+				transport_stat = stats->transport_stat[i];
+				if (transport_stat->trtype != SPDK_NVME_TRANSPORT_PCIE &&
+				    transport_stat->trtype != SPDK_NVME_TRANSPORT_VFIOUSER) {
+					continue;
+				}
+				rc = xds_nvme_poll_profile_format(
+					line, sizeof(line), spdk_env_get_current_core(),
+					&transport_stat->pcie,
+					&group->xds_completion_batch_profile);
+				if (rc > 0) {
+					SPDK_NOTICELOG("%s\n", line);
+				}
+			}
+			spdk_nvme_poll_group_free_stats(group->group, stats);
+		} else {
+			SPDK_ERRLOG("Unable to snapshot NVMe poll group stats: rc=%d\n", rc);
+		}
+	}
 
 	if (group->accel_channel) {
 		spdk_put_io_channel(group->accel_channel);
@@ -7878,7 +8355,38 @@ bdev_nvme_stop_discovery(const char *name, spdk_bdev_nvme_stop_discovery_fn cb_f
 static int
 bdev_nvme_library_init(void)
 {
+	const char *poll_profile;
+	const char *stage_shift;
+	uint8_t parsed_shift;
+	bool parsed_poll_profile;
+	int rc;
+
 	g_bdev_nvme_init_thread = spdk_get_thread();
+	g_xds_nvme_poll_profile_enabled = false;
+	g_xds_nvme_stage_profile_enabled = false;
+	g_xds_nvme_stage_profile_shift = 0;
+	poll_profile = getenv("XDS_NVME_POLL_PROFILE");
+	rc = xds_nvme_parse_poll_profile(poll_profile, &parsed_poll_profile);
+	if (rc == 0) {
+		g_xds_nvme_poll_profile_enabled = parsed_poll_profile;
+	} else if (rc != -ENOENT) {
+		SPDK_ERRLOG("Invalid XDS_NVME_POLL_PROFILE='%s': rc=%d\n",
+			    poll_profile, rc);
+		return rc;
+	}
+	if (g_xds_nvme_poll_profile_enabled) {
+		SPDK_NOTICELOG("NVMe poll-only profiling enabled\n");
+	}
+	stage_shift = getenv("XDS_NVME_STAGE_PROFILE_SHIFT");
+	rc = xds_nvme_stage_profile_parse_shift(stage_shift, &parsed_shift);
+	if (rc == 0) {
+		g_xds_nvme_stage_profile_shift = parsed_shift;
+		g_xds_nvme_stage_profile_enabled = true;
+		SPDK_NOTICELOG("NVMe stage profiling enabled: shift=%u\n", parsed_shift);
+	} else if (rc != -ENOENT) {
+		SPDK_ERRLOG("Invalid XDS_NVME_STAGE_PROFILE_SHIFT='%s': rc=%d; profiling disabled\n",
+			    stage_shift, rc);
+	}
 
 	spdk_io_device_register(&g_nvme_bdev_ctrlrs, bdev_nvme_create_poll_group_cb,
 				bdev_nvme_destroy_poll_group_cb,
@@ -8020,7 +8528,12 @@ bdev_nvme_readv_done(void *ref, const struct spdk_nvme_cpl *cpl)
 	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
 	int ret;
 
+	if (bio->xds_stage_sample) {
+		bio->xds_stage_sample->nvme_callback_tsc = spdk_get_ticks();
+	}
+
 	if (spdk_unlikely(spdk_nvme_cpl_is_pi_error(cpl))) {
+		xds_nvme_stage_profile_drop(bio, XDS_NVME_STAGE_DROP_ERROR);
 		SPDK_ERRLOG("readv completed with PI error (sct=%d, sc=%d)\n",
 			    cpl->status.sct, cpl->status.sc);
 
@@ -8474,6 +8987,13 @@ bdev_nvme_readv(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 
 	if (spdk_unlikely(rc != 0 && rc != -ENOMEM)) {
 		SPDK_ERRLOG("readv failed: rc = %d\n", rc);
+	}
+	if (bio->xds_stage_sample) {
+		if (rc == 0) {
+			bio->xds_stage_sample->cmd_submit_done_tsc = spdk_get_ticks();
+		} else {
+			xds_nvme_stage_profile_drop(bio, XDS_NVME_STAGE_DROP_ERROR);
+		}
 	}
 	return rc;
 }

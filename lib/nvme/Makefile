@@ -9,8 +9,6 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 SO_VER := 16
 SO_MINOR := 0
 
-XDS_KERNELS_ROOT ?= $(SPDK_ROOT_DIR)/../kernels
-
 C_SRCS = nvme_ctrlr_cmd.c nvme_ctrlr.c nvme_fabric.c nvme_ns_cmd.c \
 	nvme_ns.c nvme_pcie_common.c nvme_pcie.c nvme_qpair.c nvme.c \
 	nvme_quirks.c nvme_transport.c nvme_discovery.c \
@@ -24,7 +22,6 @@ C_SRCS-$(CONFIG_RDMA) += nvme_rdma.c
 
 LIBNAME = nvme
 LOCAL_SYS_LIBS =
-LOCAL_SYS_LIBS += $(XDS_KERNELS_ROOT)/user/libxds_p2p_user.a
 ifeq ($(CONFIG_RDMA),y)
 LOCAL_SYS_LIBS += -libverbs -lrdmacm
 #Attach only if FreeBSD and RDMA is specified with configure
@@ -51,8 +48,6 @@ CFLAGS += -D_FILE_OFFSET_BITS=64
 LOCAL_SYS_LIBS += -lfuse3
 endif
 
-CFLAGS += -I$(XDS_KERNELS_ROOT)/include
-CFLAGS += -I$(XDS_KERNELS_ROOT)/user/include
 CFLAGS += -Wpointer-arith
 
 SPDK_MAP_FILE = $(abspath $(CURDIR)/spdk_nvme.map)

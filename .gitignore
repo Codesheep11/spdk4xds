@@ -46,3 +46,6 @@ test/common/build_config.sh
 .run_test_name
 .spdk-isal.log
 .spdk-isal-crypto.log
+
+# Local xDS example binaries built in the source tree
+/examples/bdev/bdevperf/bdevperf_lba

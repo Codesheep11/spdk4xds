@@ -121,6 +121,69 @@ enum nvme_pcie_qpair_state {
 	NVME_PCIE_QPAIR_FAILED,
 };
 
+#define XDS_NVME_PCIE_SAMPLE_POOL_SIZE 64u
+#define XDS_NVME_PCIE_LATENCY_RESERVOIR_SIZE 4096u
+
+struct xds_nvme_pcie_sample {
+	uint64_t sq_staged_tsc;
+	uint64_t doorbell_tsc;
+	uint64_t polls_at_submit;
+	uint64_t idle_polls_at_submit;
+	uint64_t completions_at_submit;
+	uint16_t cid;
+	uint16_t qd_at_submit;
+	bool active;
+	bool pending_doorbell;
+};
+
+struct xds_nvme_pcie_profile {
+	struct xds_nvme_pcie_sample *samples;
+	int16_t *sample_by_cid;
+	uint64_t *latency_ticks;
+	uint8_t free_stack[XDS_NVME_PCIE_SAMPLE_POOL_SIZE];
+	uint8_t pending[XDS_NVME_PCIE_SAMPLE_POOL_SIZE];
+	uint64_t eligible;
+	uint64_t completed;
+	uint64_t sq_wait_ticks;
+	uint64_t doorbell_to_cqe_ticks;
+	uint64_t total_ticks;
+	uint64_t polls_delta;
+	uint64_t idle_polls_delta;
+	uint64_t completions_delta;
+	uint64_t qd_submit_sum;
+	uint64_t qd_cqe_sum;
+	uint64_t qd_residency_ticks[7];
+	uint64_t qd_best_residency_ticks[7];
+	uint64_t qd_last_tsc;
+	uint64_t qd_event_tsc;
+	uint64_t qd_idle_reset_ticks;
+	uint64_t low_qd_start_tsc;
+	uint64_t low_qd_episodes;
+	uint64_t low_qd_max_ticks;
+	uint64_t qd_best_low_qd_episodes;
+	uint64_t qd_best_low_qd_max_ticks;
+	uint64_t pool_drops;
+	uint64_t error_drops;
+	uint64_t invalid;
+	uint64_t incomplete;
+	uint64_t sample_mask;
+	uint64_t next_sample;
+	uint64_t sample_prng;
+	uint64_t latency_stored;
+	uint64_t latency_max_ticks;
+	uint64_t latency_max_polls;
+	uint64_t latency_max_idle_polls;
+	uint64_t latency_max_completions;
+	uint16_t latency_max_qd_submit;
+	uint16_t latency_max_qd_cqe;
+	uint16_t qd_last;
+	uint8_t free_count;
+	uint8_t pending_count;
+	uint8_t shift;
+	bool qd_started;
+	bool enabled;
+};
+
 /* PCIe transport extensions for spdk_nvme_qpair */
 struct nvme_pcie_qpair {
 	/* Submission queue tail doorbell */
@@ -165,6 +228,7 @@ struct nvme_pcie_qpair {
 
 		/* Disable merging of physically contiguous SGL entries */
 		uint8_t disable_pcie_sgl_merge	: 1;
+		uint8_t xds_profile_enabled	: 1;
 	} flags;
 
 	/*
@@ -200,6 +264,8 @@ struct nvme_pcie_qpair {
 
 	struct spdk_nvme_cmd *sq_vaddr;
 	struct spdk_nvme_cpl *cq_vaddr;
+
+	struct xds_nvme_pcie_profile *xds_profile;
 };
 
 static inline struct nvme_pcie_qpair *
@@ -245,6 +311,8 @@ nvme_pcie_qpair_update_mmio_required(uint16_t value,
 	return true;
 }
 
+void nvme_pcie_xds_profile_mark_doorbell(struct spdk_nvme_qpair *qpair);
+
 static inline void
 nvme_pcie_qpair_ring_sq_doorbell(struct spdk_nvme_qpair *qpair)
 {
@@ -263,6 +331,10 @@ nvme_pcie_qpair_ring_sq_doorbell(struct spdk_nvme_qpair *qpair)
 				    pqpair->sq_tail,
 				    pqpair->shadow_doorbell.sq_tdbl,
 				    pqpair->shadow_doorbell.sq_eventidx);
+	}
+
+	if (spdk_unlikely(pqpair->flags.xds_profile_enabled)) {
+		nvme_pcie_xds_profile_mark_doorbell(qpair);
 	}
 
 	if (spdk_likely(need_mmio)) {

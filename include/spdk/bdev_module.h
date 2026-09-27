@@ -819,7 +819,7 @@ typedef void (*spdk_bdev_io_get_aux_buf_cb)(struct spdk_io_channel *ch,
 		struct spdk_bdev_io *bdev_io, void *aux_buf);
 
 /* Maximum number of IOVs used for I/O splitting */
-#define SPDK_BDEV_IO_NUM_CHILD_IOV 32
+#define SPDK_BDEV_IO_NUM_CHILD_IOV 64
 
 struct spdk_bdev_io_block_params {
 	/** For SG buffer cases, array of iovecs to transfer. */

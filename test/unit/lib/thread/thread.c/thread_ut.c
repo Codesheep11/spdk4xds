@@ -156,6 +156,50 @@ poller_run_done(void *ctx)
 	return -1;
 }
 
+struct poller_order_ctx {
+	unsigned int *order;
+	unsigned int *count;
+	unsigned int value;
+};
+
+static int
+poller_record_order(void *arg)
+{
+	struct poller_order_ctx *ctx = arg;
+
+	ctx->order[(*ctx->count)++] = ctx->value;
+	return SPDK_POLLER_IDLE;
+}
+
+static void
+thread_low_priority_poller(void)
+{
+	struct spdk_poller *io_poller;
+	struct spdk_poller *refill_poller;
+	unsigned int order[2] = {0};
+	unsigned int count = 0;
+	struct poller_order_ctx io = {order, &count, 1};
+	struct poller_order_ctx refill = {order, &count, 2};
+
+	allocate_threads(1);
+	set_thread(0);
+
+	io_poller = spdk_poller_register(poller_record_order, &io, 0);
+	refill_poller = spdk_poller_register_low_priority(
+		poller_record_order, &refill);
+	SPDK_CU_ASSERT_FATAL(io_poller != NULL);
+	SPDK_CU_ASSERT_FATAL(refill_poller != NULL);
+
+	poll_thread(0);
+	CU_ASSERT_EQUAL(count, 2);
+	CU_ASSERT_EQUAL(order[0], 1);
+	CU_ASSERT_EQUAL(order[1], 2);
+
+	spdk_poller_unregister(&io_poller);
+	spdk_poller_unregister(&refill_poller);
+	free_threads();
+}
+
 static void
 thread_poller(void)
 {
@@ -2286,6 +2330,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, thread_alloc);
 	CU_ADD_TEST(suite, thread_send_msg);
 	CU_ADD_TEST(suite, thread_poller);
+	CU_ADD_TEST(suite, thread_low_priority_poller);
 	CU_ADD_TEST(suite, poller_pause);
 	CU_ADD_TEST(suite, thread_for_each);
 	CU_ADD_TEST(suite, for_each_channel_remove);

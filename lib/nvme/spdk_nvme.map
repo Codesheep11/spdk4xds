@@ -293,10 +293,7 @@
 	spdk_nvme_trid_entry_parse;
 	spdk_nvme_build_name;
 
-	spdk_nvme_xds_init;
-	spdk_nvme_xds_fini;
-	spdk_nvme_xds_register;
-	spdk_nvme_xds_unregister;
+	spdk_nvme_xds_set_translate_cb;
 	spdk_nvme_xds_translate;
 
 	local: *;

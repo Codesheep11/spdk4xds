@@ -13,6 +13,104 @@
 
 #include "spdk/log.h"
 
+struct raid0_sgl_child_ctx {
+	struct raid_bdev_io *raid_io;
+	struct iovec *iovs;
+};
+
+static void
+raid0_sgl_child_completion(struct spdk_bdev_io *bdev_io, bool success,
+			   void *cb_arg)
+{
+	struct raid0_sgl_child_ctx *ctx = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	free(ctx->iovs);
+	raid_bdev_io_complete_part(ctx->raid_io, 1, success ?
+				   SPDK_BDEV_IO_STATUS_SUCCESS :
+				   SPDK_BDEV_IO_STATUS_FAILED);
+	free(ctx);
+}
+
+/* Experimental path: one readv command per RAID0 member for aligned full strips. */
+static bool
+raid0_submit_sgl_aggregate(struct raid_bdev_io *raid_io)
+{
+	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	uint64_t strip_bytes = raid_bdev->strip_size * raid_bdev->bdev.blocklen;
+	uint64_t strip_count;
+	uint64_t iovs_per_strip;
+	uint64_t start_strip;
+	uint8_t submitted = 0;
+
+	if (!getenv("XDS_RAID0_SGL_AGGREGATE") ||
+	    raid_io->type != SPDK_BDEV_IO_TYPE_READ ||
+	    raid_io->offset_blocks % raid_bdev->strip_size != 0 ||
+	    raid_io->num_blocks % raid_bdev->strip_size != 0)
+		return false;
+
+	strip_count = raid_io->num_blocks / raid_bdev->strip_size;
+	if (strip_count <= 1 || raid_io->iovcnt <= 0 ||
+	    (uint64_t)raid_io->iovcnt % strip_count != 0)
+		return false;
+	iovs_per_strip = (uint64_t)raid_io->iovcnt / strip_count;
+	for (int i = 0; i < raid_io->iovcnt; i++)
+		if (raid_io->iovs[i].iov_len != strip_bytes / iovs_per_strip)
+			return false;
+
+	start_strip = raid_io->offset_blocks / raid_bdev->strip_size;
+	raid_io->base_bdev_io_remaining = spdk_min(strip_count,
+						    raid_bdev->num_base_bdevs);
+	for (uint8_t step = 0; step < raid_io->base_bdev_io_remaining; step++) {
+		uint8_t disk = (start_strip + step) % raid_bdev->num_base_bdevs;
+		uint64_t first = step;
+		uint64_t stripe_count_on_disk = 1 + (strip_count - 1 - first) /
+						 raid_bdev->num_base_bdevs;
+		uint64_t count = stripe_count_on_disk * iovs_per_strip;
+		uint64_t physical_strip = (start_strip + first) /
+					  raid_bdev->num_base_bdevs;
+		struct raid0_sgl_child_ctx *ctx = calloc(1, sizeof(*ctx));
+		struct raid_base_bdev_info *base_info;
+		struct spdk_io_channel *base_ch;
+		int rc;
+
+		if (!ctx)
+			goto fail;
+		ctx->iovs = calloc((size_t)count, sizeof(*ctx->iovs));
+		if (!ctx->iovs) {
+			free(ctx);
+			goto fail;
+		}
+		ctx->raid_io = raid_io;
+		for (uint64_t s = 0, j = first; s < stripe_count_on_disk;
+		     s++, j += raid_bdev->num_base_bdevs)
+			memcpy(&ctx->iovs[s * iovs_per_strip],
+			       &raid_io->iovs[j * iovs_per_strip],
+			       iovs_per_strip * sizeof(*ctx->iovs));
+
+		base_info = &raid_bdev->base_bdev_info[disk];
+		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, disk);
+		rc = raid_bdev_readv_blocks_ext(
+			base_info, base_ch, ctx->iovs, (int)count,
+			physical_strip * raid_bdev->strip_size,
+			stripe_count_on_disk * raid_bdev->strip_size,
+			raid0_sgl_child_completion, ctx, NULL);
+		if (rc != 0) {
+			free(ctx->iovs);
+			free(ctx);
+			goto fail;
+		}
+		submitted++;
+	}
+	return true;
+
+fail:
+	raid_bdev_io_complete_part(raid_io,
+		raid_io->base_bdev_io_remaining - submitted,
+		SPDK_BDEV_IO_STATUS_FAILED);
+	return true;
+}
+
 /*
  * brief:
  * raid0_bdev_io_completion function is called by lower layers to notify raid
@@ -88,6 +186,9 @@ raid0_submit_rw_request(struct raid_bdev_io *raid_io)
 	uint64_t			end_strip;
 	struct raid_base_bdev_info	*base_info;
 	struct spdk_io_channel		*base_ch;
+
+	if (raid0_submit_sgl_aggregate(raid_io))
+		return;
 
 	start_strip = raid_io->offset_blocks >> raid_bdev->strip_size_shift;
 	end_strip = (raid_io->offset_blocks + raid_io->num_blocks - 1) >>

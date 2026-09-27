@@ -37,6 +37,7 @@
 	spdk_thread_set_interrupt_mode;
 	spdk_thread_get_trace_id;
 	spdk_poller_register;
+	spdk_poller_register_low_priority;
 	spdk_poller_register_named;
 	spdk_poller_unregister;
 	spdk_poller_pause;

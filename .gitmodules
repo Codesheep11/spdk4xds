@@ -1,6 +1,7 @@
 [submodule "dpdk"]
 	path = dpdk
-	url = https://github.com/spdk/dpdk.git
+	url = https://github.com/Codesheep11/spdk4xds.git
+	branch = dpdk-v1.0
 [submodule "intel-ipsec-mb"]
 	path = intel-ipsec-mb
 	url = https://github.com/spdk/intel-ipsec-mb.git
